@@ -270,7 +270,7 @@ class StationDetector:
             if drift > Config.MAX_CENTRE_DRIFT:
                 # Different station candidate — reset counter
                 self._log_warn(
-                    f'Station candidate drifted {drift:.3f} m — resetting confirmation'
+                    f'[DETECT] Candidat ha canviat {drift:.3f}m — resettejant confirmació'
                 )
                 self._confirm_count = 0
 
@@ -279,15 +279,15 @@ class StationDetector:
         self._confirm_count += 1
 
         self._log_info(
-            f'Station candidate [{self._confirm_count}/{Config.N_CONFIRM}] '
-            f'robot=({cx_r:.3f},{cy_r:.3f})'
+            f'[DETECT] Candidat [{self._confirm_count}/{Config.N_CONFIRM}] '
+            f'centre=({cx_r:.3f},{cy_r:.3f})'
         )
 
         if self._confirm_count >= Config.N_CONFIRM:
             result = self._build_result(quad, cx_r, cy_r, robot_x, robot_y, robot_yaw)
             self._confirmed = result
             self._log_info(
-                f'Station CONFIRMED: map=({result.centre_map_x:.3f},'
+                f'[DETECT] ✓ ESTACIÓ CONFIRMADA! map=({result.centre_map_x:.3f},'
                 f'{result.centre_map_y:.3f})'
             )
             return result
@@ -308,7 +308,7 @@ class StationDetector:
         self._last_centre_x = None
         self._last_centre_y = None
         self._confirmed     = None
-        self._log_info('StationDetector reset')
+        self._log_info('[DETECT] Reset')
 
     # ----------------------------------------------------------
     # Step 1 — Clustering

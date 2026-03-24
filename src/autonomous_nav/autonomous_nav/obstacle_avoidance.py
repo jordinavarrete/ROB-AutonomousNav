@@ -321,7 +321,6 @@ class ObstacleAvoidance:
         """Force-reset to NORMAL state (call after waypoint arrival)."""
         self._state = AvoidState.NORMAL
         self._heading_history.clear()
-        self._log_info('ObstacleAvoidance reset to NORMAL')
 
     # ----------------------------------------------------------
     # State machine transitions
@@ -529,7 +528,7 @@ class ObstacleAvoidance:
 
         if (now - self._last_move_time > Config.STUCK_TIME_S
                 and self._state != AvoidState.FORCE_ROTATE):
-            self._log_warn('Anti-stuck triggered: forcing 180° rotation')
+            self._log_warn('[AVOID] ⚠ Anti-stuck! Robot bloquejat — rotació forçada 180°')
             self._force_rot_accumulated = 0.0
             self._transition(AvoidState.FORCE_ROTATE)
 
@@ -622,7 +621,7 @@ class ObstacleAvoidance:
         """Log and perform a state transition."""
         if new_state != self._state:
             self._log_info(
-                f'ObstacleAvoidance: {self._state.name} → {new_state.name}'
+                f'[AVOID] {self._state.name} → {new_state.name}'
             )
             self._state = new_state
 

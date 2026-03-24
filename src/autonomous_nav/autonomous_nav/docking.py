@@ -187,8 +187,9 @@ class DockingController:
         self._station_map_x = station_map_x
         self._station_map_y = station_map_y
         self._transition(DockState.APPROACH)
+        self._fine_log_tick = 0
         self._log_info(
-            f'Docking activated → station map=({station_map_x:.3f},{station_map_y:.3f})'
+            f'[DOCK] Activat → estació map=({station_map_x:.3f},{station_map_y:.3f})'
         )
 
     def update_scan(self, scan_msg) -> None:
@@ -344,7 +345,7 @@ class DockingController:
 
         # --- Timeout guard ---
         if self._fine_start_time and (now - self._fine_start_time) > Config.FINE_CENTRE_TIMEOUT:
-            self._log_warn(f'Fine-centre timeout ({Config.FINE_CENTRE_TIMEOUT}s) — FAILED')
+            self._log_warn(f'[DOCK] ✗ Timeout fine-centre ({Config.FINE_CENTRE_TIMEOUT}s)')
             self._transition(DockState.FAILED)
             return VelocityCommand(0.0, 0.0)
 
@@ -355,7 +356,8 @@ class DockingController:
 
         if pillars is None:
             self._lost_ticks += 1
-            self._log_warn(f'Pillars not detected ({self._lost_ticks}/{Config.MAX_LOST_TICKS})')
+            if self._lost_ticks == 1 or self._lost_ticks % 10 == 0:
+                self._log_warn(f'[DOCK] Pilars perduts ({self._lost_ticks}/{Config.MAX_LOST_TICKS})')
 
             if self._lost_ticks >= Config.MAX_LOST_TICKS:
                 self._transition(DockState.FAILED)
@@ -375,9 +377,13 @@ class DockingController:
         self._status.centroid_y = cy
         self._status.offset     = offset
 
-        self._log_info(
-            f'Fine-centre: centroid=({cx:.4f},{cy:.4f}) offset={offset:.4f}m'
-        )
+        # Throttle log: only every ~1s (20 ticks at 20Hz)
+        self._fine_log_tick = getattr(self, '_fine_log_tick', 0) + 1
+        if self._fine_log_tick % 20 == 0:
+            self._log_info(
+                f'[DOCK] Centrant: offset={offset:.4f}m  '
+                f'cx=({cx:.4f},{cy:.4f})'
+            )
 
         # --- Docked check ---
         if offset < Config.DOCK_TOLERANCE:
@@ -461,7 +467,7 @@ class DockingController:
     def _transition(self, new_state: DockState) -> None:
         """Log and perform a state transition."""
         if new_state != self._state:
-            self._log_info(f'Docking: {self._state.name} → {new_state.name}')
+            self._log_info(f'[DOCK] {self._state.name} → {new_state.name}')
             self._state = new_state
             self._status.state = new_state
 

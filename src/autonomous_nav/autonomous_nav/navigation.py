@@ -240,7 +240,9 @@ class WaypointNavigator:
         self._target_x = x
         self._target_y = y
         self._transition(NavState.ORIENT)
-        self._log_info(f'New waypoint set: ({x:.2f}, {y:.2f})')
+        pose = self._active_pose()
+        dist = pose.distance_to(x, y)
+        self._log_info(f'[NAV] Waypoint → ({x:.2f}, {y:.2f})  dist={dist:.2f}m')
 
     def clear_waypoint(self) -> None:
         """Cancel current waypoint and return to IDLE."""
@@ -359,9 +361,10 @@ class WaypointNavigator:
         if dist < Config.ARRIVAL_THRESHOLD:
             self._waypoints_completed += 1
             self._transition(NavState.ARRIVED)
+            dist = pose.distance_to(self._target_x, self._target_y)
             self._log_info(
-                f'Arrived at ({self._target_x:.2f}, {self._target_y:.2f}) '
-                f'— total waypoints: {self._waypoints_completed}'
+                f'[NAV] ✓ Arrived ({self._target_x:.2f}, {self._target_y:.2f})  '
+                f'error={dist:.3f}m  total={self._waypoints_completed}'
             )
             return VelocityCommand(0.0, 0.0)
 
@@ -404,13 +407,8 @@ class WaypointNavigator:
         return self._odom_pose
 
     def _transition(self, new_state: NavState) -> None:
-        """Log and perform a state transition."""
+        """Perform a state transition (silent for ORIENT/NAVIGATE to reduce noise)."""
         if new_state != self._state:
-            self._log_info(
-                f'Navigator: {self._state.name} → {new_state.name}'
-                + (f' target=({self._target_x:.2f},{self._target_y:.2f})'
-                   if self._target_x is not None else '')
-            )
             self._state = new_state
 
     def _log_info(self, msg: str) -> None:

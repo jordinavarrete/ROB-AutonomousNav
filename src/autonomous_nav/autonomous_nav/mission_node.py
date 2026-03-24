@@ -204,8 +204,15 @@ class MissionNode(Node):
 
         self._control_timer  = self.create_timer(control_dt,  self._control_loop)
         self._watchdog_timer = self.create_timer(watchdog_dt, self._watchdog)
+        self._status_tick    = 0
 
-        self.get_logger().info('MissionNode initialised — waiting for first scan and odom')
+        self.get_logger().info(
+            '\n'
+            '================================================\n'
+            '  AUTONOMOUS NAVIGATION - Mission Node          \n'
+            '  Esperant /scan i /odom...                     \n'
+            '================================================'
+        )
 
     # ==========================================================
     # ROS2 CALLBACKS
@@ -304,6 +311,11 @@ class MissionNode(Node):
         elif self._phase == MissionPhase.MISSION_COMPLETE:
             self._publish_stop()
 
+        # Periodic status log (every ~2s = 40 ticks at 20Hz)
+        self._status_tick += 1
+        if self._status_tick % 40 == 0:
+            self._log_status()
+
         # Log telemetry
         self._update_logger()
 
@@ -353,10 +365,6 @@ class MissionNode(Node):
             elif self._wp_queue:
                 wx, wy = self._wp_queue.pop(0)
                 self._navigator.set_waypoint(wx, wy)
-                self.get_logger().info(
-                    f'Phase I: next waypoint ({wx:.2f},{wy:.2f}), '
-                    f'{len(self._wp_queue)} remaining'
-                )
             else:
                 # All Phase I waypoints done → Punt Base reached
                 self._transition(MissionPhase.PHASE_II_EXPLORE)
@@ -393,8 +401,12 @@ class MissionNode(Node):
             self._station_map_x = result.centre_map_x
             self._station_map_y = result.centre_map_y
             self.get_logger().info(
-                f'Station FOUND at map=({self._station_map_x:.3f},'
-                f'{self._station_map_y:.3f}) — returning to Punt Base'
+                '\n'
+                '---------------------------------------------\n'
+                f'  ESTACIO TROBADA!                          \n'
+                f'  map=({self._station_map_x:.3f}, {self._station_map_y:.3f})\n'
+                '  Tornant a Punt Base...                     \n'
+                '---------------------------------------------'
             )
             self._transition(MissionPhase.PHASE_II_RETURN)
             self._wp_queue = list(Config.WAYPOINTS_PHASE2_RETURN)
@@ -413,13 +425,9 @@ class MissionNode(Node):
             elif self._wp_queue:
                 wx, wy = self._wp_queue.pop(0)
                 self._navigator.set_waypoint(wx, wy)
-                self.get_logger().info(
-                    f'Phase II explore: next ({wx:.2f},{wy:.2f}), '
-                    f'{len(self._wp_queue)} remaining'
-                )
             else:
                 self.get_logger().warn(
-                    'Phase II: station not found after full sweep — repeating'
+                    '[MISSION] Sweep complet sense trobar estacio - repetint'
                 )
                 self._wp_queue = list(Config.WAYPOINTS_PHASE2_EXPLORE)
                 wx, wy = self._wp_queue.pop(0)
@@ -452,7 +460,7 @@ class MissionNode(Node):
             if self._using_temp_waypoints and not self._wp_queue:
                 self._finish_temp_waypoints()
             else:
-                self.get_logger().info('Arrived at Punt Base — saving map')
+                self.get_logger().info('[MISSION] Arribat a Punt Base - guardant mapa')
                 self._save_map()
                 self._transition(MissionPhase.PHASE_III_DOCK)
                 self._docker.activate(self._station_map_x, self._station_map_y)
@@ -467,14 +475,24 @@ class MissionNode(Node):
         Watchdog still fires independently.
         """
         if self._docker.is_docked():
-            self.get_logger().info('DOCKED successfully — mission complete!')
+            self.get_logger().info(
+                '\n'
+                '================================================\n'
+                '  MISSIO COMPLETADA!                            \n'
+                '  Robot estacionat correctament.                \n'
+                '================================================'
+            )
             self._publish_stop()
             self._transition(MissionPhase.MISSION_COMPLETE)
             return
 
         if self._docker.has_failed():
             self.get_logger().error(
-                'Docking FAILED — stopping. Manual intervention required.'
+                '\n'
+                '------------------------------------------------\n'
+                '  DOCKING HA FALLAT!                            \n'
+                '  Cal intervencio manual.                       \n'
+                '------------------------------------------------'
             )
             self._publish_stop()
             self._transition(MissionPhase.MISSION_COMPLETE)
@@ -641,17 +659,46 @@ class MissionNode(Node):
         msg.data = self._phase.name
         self._state_pub.publish(msg)
 
+    def _log_status(self) -> None:
+        """Periodic status line (~every 2s) showing robot state at a glance."""
+        wp_x, wp_y = self._next_waypoint()
+        dist = math.sqrt((self._x - wp_x)**2 + (self._y - wp_y)**2)
+        avoid_st = self._avoider.get_state().name
+        elapsed = time.time() - self._phase_start_t
+        slam = 'SLAM' if self._slam_valid else 'ODOM'
+        tmp = ' [A*]' if self._using_temp_waypoints else ''
+        wps_left = len(self._wp_queue)
+        self.get_logger().info(
+            f'[STATUS] {self._phase.name} | '
+            f'pos=({self._x:.2f},{self._y:.2f}) | '
+            f'wp=({wp_x:.2f},{wp_y:.2f}) dist={dist:.2f}m | '
+            f'avoid={avoid_st} | {slam}{tmp} | '
+            f'queue={wps_left} | t={elapsed:.0f}s'
+        )
+
     def _transition(self, new_phase: MissionPhase) -> None:
-        """Log and perform a mission phase transition."""
+        """Log and perform a mission phase transition with visual banner."""
         if new_phase != self._phase:
+            phase_labels = {
+                MissionPhase.INIT:             'INICIALITZANT',
+                MissionPhase.PHASE_I:          'FASE I - Navegacio Zona1 -> Zona2',
+                MissionPhase.PHASE_II_EXPLORE: 'FASE II - Exploracio + Deteccio',
+                MissionPhase.PHASE_II_RETURN:  'FASE II - Retorn a Punt Base',
+                MissionPhase.PHASE_III_DOCK:   'FASE III - Docking de precisio',
+                MissionPhase.MISSION_COMPLETE: 'MISSIO COMPLETADA',
+            }
+            label = phase_labels.get(new_phase, new_phase.name)
             self.get_logger().info(
-                f'Mission: {self._phase.name} → {new_phase.name}'
+                '\n'
+                '================================================\n'
+                f'  [MISSION] {label}\n'
+                '================================================'
             )
             self._phase         = new_phase
             self._phase_start_t = time.time()
 
     def _check_timeouts(self) -> None:
-        """Log a warning if the current phase has exceeded its timeout."""
+        """Log a warning if the current phase has exceeded its timeout (throttled)."""
         elapsed = time.time() - self._phase_start_t
         limits = {
             MissionPhase.PHASE_I:          Config.PHASE_I_TIMEOUT_S,
@@ -661,10 +708,12 @@ class MissionNode(Node):
         }
         limit = limits.get(self._phase)
         if limit and elapsed > limit:
-            self.get_logger().warn(
-                f'[TIMEOUT] {self._phase.name} exceeded {limit:.0f}s '
-                f'(elapsed {elapsed:.0f}s) — continuing best-effort'
-            )
+            # Only warn every ~30s to avoid spam
+            if int(elapsed) % 30 == 0 and self._status_tick % 40 < 2:
+                self.get_logger().warn(
+                    f'[MISSION] Timeout: {self._phase.name} porta {elapsed:.0f}s '
+                    f'(limit {limit:.0f}s)'
+                )
 
     def _update_logger(self) -> None:
         """Push latest telemetry to the CSV logger."""
