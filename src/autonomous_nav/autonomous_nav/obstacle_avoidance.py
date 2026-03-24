@@ -58,6 +58,10 @@ class Config:
     FORCE_ROTATE_ANGLE  = 3.14159  # rad ≈ 180°
     FORCE_ROTATE_SPEED  = 0.50   # rad/s
 
+    # Bug2 Route Return Parameters
+    M_LINE_THRESHOLD    = 0.20   # m - wide margin to consider the "hit->target" line crossed
+    DISTANCE_PROGRESS_MIN = 0.20 # m - how much closer to target we must be to resume normal path
+
     # Minimum valid LiDAR range (metres) — below this, reading is likely noise
     MIN_VALID_RANGE     = 0.12
 
@@ -207,6 +211,12 @@ class ObstacleAvoidance:
         self._range_min   = Config.MIN_VALID_RANGE
         self._range_max   = 3.5
 
+        # Bug2 tracking
+        self._hit_x = 0.0
+        self._hit_y = 0.0
+        self._wp_hit_x = 0.0
+        self._wp_hit_y = 0.0
+
     # ----------------------------------------------------------
     # Public API — called from mission_node.py
     # ----------------------------------------------------------
@@ -345,6 +355,11 @@ class ObstacleAvoidance:
         if self._state == AvoidState.NORMAL:
             if front.alert in (AlertLevel.DANGER, AlertLevel.WARNING):
                 self._wall_side = self._choose_wall_side()
+                # Store Bug2 hit point and waypoint
+                self._hit_x = robot_x
+                self._hit_y = robot_y
+                self._wp_hit_x = wp_x
+                self._wp_hit_y = wp_y
                 self._transition(AvoidState.AVOID_ROTATE)
 
         elif self._state == AvoidState.AVOID_ROTATE:
@@ -358,14 +373,23 @@ class ObstacleAvoidance:
                 self._wall_side = self._choose_wall_side()
                 self._transition(AvoidState.AVOID_ROTATE)
             elif front.alert == AlertLevel.SAFE:
-                self._transition(AvoidState.RECOVERING)
+                if self._is_on_m_line(robot_x, robot_y, wp_x, wp_y):
+                    self._transition(AvoidState.NORMAL)
+                else:
+                    self._transition(AvoidState.RECOVERING)
 
         elif self._state == AvoidState.RECOVERING:
             if front.alert in (AlertLevel.DANGER, AlertLevel.WARNING):
                 self._wall_side = self._choose_wall_side()
                 self._transition(AvoidState.AVOID_ROTATE)
                 return
-            # Track heading improvement
+
+            # Check Bug2 exit condition
+            if self._is_on_m_line(robot_x, robot_y, wp_x, wp_y):
+                self._transition(AvoidState.NORMAL)
+                return
+
+            # Track heading improvement (fallback check)
             abs_err = abs(self._angle_to_waypoint(robot_x, robot_y, robot_yaw, wp_x, wp_y))
             now = time.time()
             self._heading_history.append((now, abs_err))
@@ -432,6 +456,36 @@ class ObstacleAvoidance:
                             min(Config.MAX_WALL_ANGULAR, angular_corr))
 
         return VelocityCommand(Config.WALL_FOLLOW_SPEED, angular_corr)
+
+    # ----------------------------------------------------------
+    # Bug2 line check
+    # ----------------------------------------------------------
+
+    def _is_on_m_line(self, rx: float, ry: float, wp_x: float, wp_y: float) -> bool:
+        """
+        Check if the robot is close to the line from hit_point to waypoint,
+        and is also strictly closer to the goal than the hit_point was.
+        """
+        if wp_x != self._wp_hit_x or wp_y != self._wp_hit_y:
+            return False
+
+        x1, y1 = self._hit_x, self._hit_y
+        x2, y2 = wp_x, wp_y
+
+        num = abs((y2 - y1)*rx - (x2 - x1)*ry + x2*y1 - y2*x1)
+        den = math.sqrt((y2 - y1)**2 + (x2 - x1)**2)
+
+        if den < 1e-6:
+            return False
+
+        dist_to_line = num / den
+
+        dist_to_wp_now = math.sqrt((wp_x - rx)**2 + (wp_y - ry)**2)
+        dist_to_wp_hit = math.sqrt((wp_x - x1)**2 + (wp_y - y1)**2)
+
+        progress = dist_to_wp_hit - dist_to_wp_now
+
+        return dist_to_line < Config.M_LINE_THRESHOLD and progress > Config.DISTANCE_PROGRESS_MIN
 
     # ----------------------------------------------------------
     # Helper: side selection
