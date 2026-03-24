@@ -35,6 +35,9 @@ class Config:
     PHASE_II_TIMEOUT_S  = 480.0   # 8 minutes
     PHASE_III_TIMEOUT_S = 120.0   # 2 minutes
 
+    # Route planner fallback
+    AVOIDANCE_TIMEOUT_S = 30.0    # s — trigger A* if avoidance active this long
+
     # SLAM TF frame names
     MAP_FRAME           = 'map'
     BASE_FRAME          = 'base_footprint'
@@ -72,7 +75,7 @@ import subprocess
 import sys
 import time
 from enum import Enum, auto
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import rclpy
 from rclpy.node import Node
@@ -84,13 +87,14 @@ from tf2_ros import LookupException, ConnectivityException, ExtrapolationExcepti
 
 # ROS2 message types
 from geometry_msgs.msg import TwistStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 # Our modules (same package)
 from autonomous_nav.navigation       import WaypointNavigator, normalize_angle
 from autonomous_nav.obstacle_avoidance import ObstacleAvoidance, AvoidState
+from autonomous_nav.route_planner     import RoutePlanner
 from autonomous_nav.station_detector  import StationDetector
 from autonomous_nav.docking           import DockingController, DockState
 from autonomous_nav.mission_logger    import MissionLogger
@@ -118,7 +122,8 @@ class MissionNode(Node):
 
     Instantiates and coordinates:
         WaypointNavigator  — waypoint-to-waypoint navigation
-        ObstacleAvoidance  — LiDAR sector classification + wall-follow
+        ObstacleAvoidance  — LiDAR sector classification + Bug2
+        RoutePlanner       — A* fallback on OccupancyGrid
         StationDetector    — 4-pillar cluster detection
         DockingController  — approach + live centering
         MissionLogger      — CSV telemetry
@@ -142,8 +147,9 @@ class MissionNode(Node):
         # ----------------------------------------------------------
         # Subscribers
         # ----------------------------------------------------------
-        self.create_subscription(LaserScan, '/scan', self._scan_cb,  qos_best_effort)
-        self.create_subscription(Odometry,  '/odom', self._odom_cb,  qos_reliable)
+        self.create_subscription(LaserScan,     '/scan', self._scan_cb,  qos_best_effort)
+        self.create_subscription(Odometry,       '/odom', self._odom_cb,  qos_reliable)
+        self.create_subscription(OccupancyGrid,  '/map',  self._map_cb,   qos_reliable)
 
         # ----------------------------------------------------------
         # TF2 for SLAM-corrected pose
@@ -165,6 +171,7 @@ class MissionNode(Node):
         # ----------------------------------------------------------
         self._navigator = WaypointNavigator(logger=self.get_logger())
         self._avoider   = ObstacleAvoidance(logger=self.get_logger())
+        self._planner   = RoutePlanner(logger=self.get_logger())
         self._detector  = StationDetector(logger=self.get_logger())
         self._docker    = DockingController(
             navigator=self._navigator,
@@ -182,6 +189,12 @@ class MissionNode(Node):
         self._station_map_x: Optional[float] = None
         self._station_map_y: Optional[float] = None
         self._scan_ready    = False
+
+        # Route planner state
+        self._avoidance_start_t: Optional[float] = None   # when avoidance began
+        self._avoidance_dist_at_start: float = float('inf')  # dist to WP when avoidance started
+        self._using_temp_waypoints = False   # True if currently following A* path
+        self._original_waypoint: Optional[Tuple[float, float]] = None  # WP before A* insertion
 
         # ----------------------------------------------------------
         # Timers
@@ -204,6 +217,10 @@ class MissionNode(Node):
         self._detector.update_scan(msg)
         self._docker.update_scan(msg)
         self._scan_ready = True
+
+    def _map_cb(self, msg: OccupancyGrid) -> None:
+        """Forward OccupancyGrid to the route planner."""
+        self._planner.update_map(msg)
 
     def _odom_cb(self, msg: Odometry) -> None:
         """
@@ -313,23 +330,27 @@ class MissionNode(Node):
         Drives through WAYPOINTS_PHASE1 using the navigator.
         ObstacleAvoidance pre-empts navigation when obstacles detected.
         """
+        wp_x, wp_y = self._next_waypoint()
         cmd, in_avoidance = self._avoider.compute(
-            self._x, self._y, self._yaw,
-            *self._next_waypoint()
+            self._x, self._y, self._yaw, wp_x, wp_y
         )
 
         if in_avoidance:
-            # Avoidance module controls velocity
             self._publish(cmd.linear_x, cmd.angular_z)
+            self._track_avoidance(wp_x, wp_y)
         else:
-            # Navigator controls velocity
+            self._reset_avoidance_tracker()
             nav_cmd = self._navigator.step()
             self._publish(nav_cmd.linear_x, nav_cmd.angular_z)
 
         # Advance waypoints
         if self._navigator.has_arrived():
             self._avoider.reset()
-            if self._wp_queue:
+            self._reset_avoidance_tracker()
+            # If using temp waypoints from A*, check if original WP should be restored
+            if self._using_temp_waypoints and not self._wp_queue:
+                self._finish_temp_waypoints()
+            elif self._wp_queue:
                 wx, wy = self._wp_queue.pop(0)
                 self._navigator.set_waypoint(wx, wy)
                 self.get_logger().info(
@@ -353,14 +374,16 @@ class MissionNode(Node):
         runs on every scan.  On confirmation, records station position and
         transitions to PHASE_II_RETURN.
         """
+        wp_x, wp_y = self._next_waypoint()
         cmd, in_avoidance = self._avoider.compute(
-            self._x, self._y, self._yaw,
-            *self._next_waypoint()
+            self._x, self._y, self._yaw, wp_x, wp_y
         )
 
         if in_avoidance:
             self._publish(cmd.linear_x, cmd.angular_z)
+            self._track_avoidance(wp_x, wp_y)
         else:
+            self._reset_avoidance_tracker()
             nav_cmd = self._navigator.step()
             self._publish(nav_cmd.linear_x, nav_cmd.angular_z)
 
@@ -378,12 +401,16 @@ class MissionNode(Node):
             wx, wy = self._wp_queue.pop(0)
             self._navigator.set_waypoint(wx, wy)
             self._avoider.reset()
+            self._reset_avoidance_tracker()
             return
 
         # Advance exploration waypoints
         if self._navigator.has_arrived():
             self._avoider.reset()
-            if self._wp_queue:
+            self._reset_avoidance_tracker()
+            if self._using_temp_waypoints and not self._wp_queue:
+                self._finish_temp_waypoints()
+            elif self._wp_queue:
                 wx, wy = self._wp_queue.pop(0)
                 self._navigator.set_waypoint(wx, wy)
                 self.get_logger().info(
@@ -391,8 +418,6 @@ class MissionNode(Node):
                     f'{len(self._wp_queue)} remaining'
                 )
             else:
-                # Exploration exhausted without finding station
-                # Loop back to first exploration waypoint
                 self.get_logger().warn(
                     'Phase II: station not found after full sweep — repeating'
                 )
@@ -408,24 +433,29 @@ class MissionNode(Node):
 
         Also saves the SLAM map on arrival.
         """
+        wp_x, wp_y = self._next_waypoint()
         cmd, in_avoidance = self._avoider.compute(
-            self._x, self._y, self._yaw,
-            *self._next_waypoint()
+            self._x, self._y, self._yaw, wp_x, wp_y
         )
 
         if in_avoidance:
             self._publish(cmd.linear_x, cmd.angular_z)
+            self._track_avoidance(wp_x, wp_y)
         else:
+            self._reset_avoidance_tracker()
             nav_cmd = self._navigator.step()
             self._publish(nav_cmd.linear_x, nav_cmd.angular_z)
 
         if self._navigator.has_arrived():
             self._avoider.reset()
-            self.get_logger().info('Arrived at Punt Base — saving map')
-            self._save_map()
-            self._transition(MissionPhase.PHASE_III_DOCK)
-            # Activate docking
-            self._docker.activate(self._station_map_x, self._station_map_y)
+            self._reset_avoidance_tracker()
+            if self._using_temp_waypoints and not self._wp_queue:
+                self._finish_temp_waypoints()
+            else:
+                self.get_logger().info('Arrived at Punt Base — saving map')
+                self._save_map()
+                self._transition(MissionPhase.PHASE_III_DOCK)
+                self._docker.activate(self._station_map_x, self._station_map_y)
 
     # ----------------------------------------------------------
 
@@ -482,6 +512,105 @@ class MissionNode(Node):
         if self._navigator._target_x is not None:
             return self._navigator._target_x, self._navigator._target_y
         return self._x, self._y
+
+    # ----------------------------------------------------------
+    # Route planner fallback
+    # ----------------------------------------------------------
+
+    def _track_avoidance(self, wp_x: float, wp_y: float) -> None:
+        """
+        Track how long obstacle avoidance has been continuously active.
+        If it exceeds AVOIDANCE_TIMEOUT_S, trigger the A* route planner.
+        """
+        now = time.time()
+
+        if self._avoidance_start_t is None:
+            self._avoidance_start_t = now
+            self._avoidance_dist_at_start = math.sqrt(
+                (self._x - wp_x)**2 + (self._y - wp_y)**2
+            )
+            return
+
+        elapsed = now - self._avoidance_start_t
+        if elapsed < Config.AVOIDANCE_TIMEOUT_S:
+            return
+
+        # Timeout: check if we've made significant progress
+        current_dist = math.sqrt(
+            (self._x - wp_x)**2 + (self._y - wp_y)**2
+        )
+        progress = self._avoidance_dist_at_start - current_dist
+
+        if progress > 0.50:
+            # Making progress, reset timer
+            self._avoidance_start_t = now
+            self._avoidance_dist_at_start = current_dist
+            return
+
+        # No progress → trigger A* fallback
+        self.get_logger().warn(
+            f'[RoutePlanner] Avoidance active {elapsed:.0f}s without progress '
+            f'(progress={progress:.2f}m) — computing A* path'
+        )
+        self._trigger_route_planner(wp_x, wp_y)
+
+    def _trigger_route_planner(self, wp_x: float, wp_y: float) -> None:
+        """
+        Compute A* path and insert temporary waypoints.
+        """
+        if not self._planner.has_map():
+            self.get_logger().warn(
+                '[RoutePlanner] No map available — continuing with Bug2'
+            )
+            self._avoidance_start_t = time.time()  # reset to avoid spam
+            return
+
+        temp_wps = self._planner.compute_path(
+            self._x, self._y, wp_x, wp_y
+        )
+
+        if not temp_wps:
+            self.get_logger().warn(
+                '[RoutePlanner] A* found no path — continuing with Bug2'
+            )
+            self._avoidance_start_t = time.time()
+            return
+
+        # Save the original target for restoration later
+        self._original_waypoint = (wp_x, wp_y)
+        self._using_temp_waypoints = True
+
+        # Set up temporary waypoint queue
+        self._wp_queue = list(temp_wps)
+        first_wp = self._wp_queue.pop(0)
+        self._navigator.set_waypoint(*first_wp)
+        self._avoider.reset()
+        self._avoidance_start_t = None
+
+        self.get_logger().info(
+            f'[RoutePlanner] Inserted {len(temp_wps)} temp waypoints. '
+            f'First: ({first_wp[0]:.2f},{first_wp[1]:.2f})'
+        )
+
+    def _finish_temp_waypoints(self) -> None:
+        """
+        All temporary A* waypoints consumed.
+        Resume navigation to the original target waypoint.
+        """
+        self._using_temp_waypoints = False
+
+        if self._original_waypoint is not None:
+            ox, oy = self._original_waypoint
+            self._navigator.set_waypoint(ox, oy)
+            self._original_waypoint = None
+            self.get_logger().info(
+                f'[RoutePlanner] Temp waypoints done — resuming to '
+                f'original WP ({ox:.2f},{oy:.2f})'
+            )
+
+    def _reset_avoidance_tracker(self) -> None:
+        """Reset the avoidance timeout tracking."""
+        self._avoidance_start_t = None
 
     def _publish(self, linear_x: float, angular_z: float) -> None:
         """
