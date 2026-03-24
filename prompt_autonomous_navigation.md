@@ -318,7 +318,8 @@ autonomous_nav/
 │   ├── __init__.py
 │   ├── mission_node.py          ← Main mission controller (entry point)
 │   ├── navigation.py            ← Waypoint navigation + orientation control
-│   ├── obstacle_avoidance.py    ← LiDAR processing, sector classification, wall-follow
+│   ├── obstacle_avoidance.py    ← LiDAR processing, sector classification, Bug2 wall-follow
+│   ├── route_planner.py         ← A* path planning on OccupancyGrid (map-based fallback)
 │   ├── station_detector.py      ← Pillar clustering, station geometry validation
 │   ├── docking.py               ← Precision centering inside station
 │   └── mission_logger.py        ← CSV log writer
@@ -337,10 +338,11 @@ Implement a ROS2 node that:
   ```
   PHASE_I → PHASE_II_EXPLORE → PHASE_II_RETURN → PHASE_III_DOCK → MISSION_COMPLETE
   ```
-- Delegates to sub-modules: navigation, obstacle avoidance, station detector, docking
+- Delegates to sub-modules: navigation, obstacle avoidance, route planner, station detector, docking
 - Has a **safety watchdog** that runs at 50Hz independently: if any LiDAR sector enters `DANGER` zone, publishes a zero-velocity stop command regardless of current state
 - Publishes mission state to `/mission_state` (std_msgs/String)
 - Handles `KeyboardInterrupt` by publishing a stop command before shutdown
+- **Map-based fallback**: if obstacle avoidance has been active for more than `AVOIDANCE_TIMEOUT_S` seconds without progress toward the waypoint, calls `route_planner.py` to compute an A*-based path on the latest `/map` OccupancyGrid and inserts temporary intermediate waypoints to navigate around the known obstacle
 
 ### `navigation.py` — Waypoint navigator
 
@@ -359,7 +361,7 @@ ORIENT → NAVIGATE → ARRIVED
 - Waypoint list for Phase I: `[(3.72, 2.55), (5.92, 8.12), (5.10, 12.61)]` then `(5.00, 11.69)`
 - Waypoints for Phase II exploration (Passadís sweep): `[(0.30, 11.01), (1.90, 12.21), (7.12, 12.61)]`
 
-### `obstacle_avoidance.py` — LiDAR processor + avoidance controller
+### `obstacle_avoidance.py` — LiDAR processor + Bug2 avoidance controller
 
 **Sector definitions** (angles relative to robot front = 0°):
 ```
@@ -377,12 +379,25 @@ WARNING_DIST = 0.45   # m  → slow down and prepare avoidance
 SAFE_DIST    = 0.60   # m  → clear
 ```
 
-**Wall-follow controller:**
+**Bug2 algorithm (primary obstacle avoidance):**
+
+When the robot detects an obstacle in FRONT (DANGER or WARNING):
+1. **Save hit point**: store the robot's current position `(hit_x, hit_y)` and the current target waypoint `(wp_x, wp_y)`
+2. **Compute the m-line**: the imaginary straight line from `hit_point` to `waypoint`
+3. **Enter wall-follow**: rotate away from obstacle, then follow the wall laterally
+4. **Exit condition (m-line crossing)**: continuously compute the robot's perpendicular distance to the m-line. Exit wall-follow and return to NORMAL navigation when:
+   - Distance from robot to m-line < `M_LINE_THRESHOLD` (0.20 m)
+   - Robot is at least `DISTANCE_PROGRESS_MIN` (0.20 m) closer to the waypoint than the hit_point was
+   - FRONT sector is SAFE (no immediate obstacle)
+5. **Fallback exit**: if the m-line condition is not met, fall back to the heading-improvement heuristic (heading toward waypoint must be improving over a 2-second window)
+
+**Wall-follow states:**
 ```
-WALL_FOLLOW states:
+  NORMAL        → nominal navigation, no obstacles
   AVOID_ROTATE  → rotate in place toward the side with most free space
   WALL_FOLLOW   → maintain lateral distance to wall while moving forward
-  RECOVERING    → front clear, heading toward waypoint improving → exit
+  RECOVERING    → front clear, checking m-line or heading improvement → exit to NORMAL
+  FORCE_ROTATE  → anti-stuck: forced 180° rotation
 ```
 
 Wall-follow side selection: choose left or right based on which side has greater minimum distance in the lateral sector.
@@ -393,9 +408,60 @@ Wall-follow lateral control:
 - `angular_correction = Kp_wall * lateral_error`
 - Forward speed reduced to `WALL_FOLLOW_SPEED = 0.10` m/s
 
-Exit wall-follow condition: `FRONT` sector is SAFE **and** angle toward next waypoint is improving (decreasing over last 2 seconds).
+Anti-stuck logic: if robot has not moved more than 5 cm in 10 seconds, force a 180° rotation.
 
-Anti-stuck logic: if robot has not moved more than 3 cm in 5 seconds, force a 180° rotation.
+### `route_planner.py` — Map-based A* path planner (fallback)
+
+This module provides a **secondary navigation strategy** using the SLAM-generated OccupancyGrid (`/map`). It is NOT the primary navigation method — the robot primarily uses direct waypoint navigation with Bug2 obstacle avoidance. The route planner activates **only** when Bug2 avoidance fails to make progress.
+
+**When to activate:**
+- `mission_node.py` monitors how long obstacle avoidance has been continuously active
+- If avoidance has been active for > `AVOIDANCE_TIMEOUT_S` (default: 30 seconds) without the robot getting significantly closer to its waypoint, the route planner is triggered
+- The route planner is also triggered after a `FORCE_ROTATE` anti-stuck event
+
+**Algorithm:**
+1. **Subscribe to `/map`** (`nav_msgs/OccupancyGrid`) — store the latest map locally
+2. **Convert robot position and target waypoint from world coordinates to grid cells** using the map's `info.resolution` and `info.origin`:
+   ```python
+   grid_x = int((world_x - origin_x) / resolution)
+   grid_y = int((world_y - origin_y) / resolution)
+   ```
+3. **Inflate obstacles** in the grid by the robot's radius (~0.10 m) to create a safety margin. Any cell with occupancy > 65 (out of 100) is considered occupied. Inflate occupied cells by `INFLATE_RADIUS_CELLS` cells in all directions.
+4. **Run A*** from the robot's current cell to the target waypoint cell on the inflated grid. Use 8-connected neighbors. Heuristic = Euclidean distance.
+5. **Simplify the A* path** to a small number of intermediate waypoints:
+   - Walk along the path and keep only the points where the direction changes significantly (> 30°)
+   - Also keep a waypoint every `MAX_WAYPOINT_SPACING` metres (default: 1.0 m) to avoid very long straight segments without checkpoints
+   - Limit to at most `MAX_TEMP_WAYPOINTS` (default: 10) intermediate waypoints
+6. **Convert grid waypoints back to world coordinates** and return them as a list of `(x, y)` tuples
+7. **Return to normal**: once all temporary waypoints have been reached, the robot resumes direct navigation toward the original target waypoint with Bug2 avoidance
+
+**Integration with mission_node.py:**
+```python
+# In the control loop, when avoidance has been active too long:
+if avoidance_active_time > Config.AVOIDANCE_TIMEOUT_S:
+    temp_waypoints = route_planner.compute_path(robot_x, robot_y, wp_x, wp_y)
+    if temp_waypoints:
+        # Insert temporary waypoints BEFORE the current target
+        wp_queue = temp_waypoints + [original_waypoint]
+        navigator.set_waypoint(*wp_queue.pop(0))
+        avoider.reset()
+```
+
+**Config parameters for route_planner.py:**
+```python
+class Config:
+    INFLATE_RADIUS_M      = 0.15   # m — obstacle inflation radius (robot radius + margin)
+    OCCUPANCY_THRESHOLD   = 65     # grid cells above this value → occupied
+    MAX_WAYPOINT_SPACING  = 1.0    # m — max distance between simplified waypoints
+    DIRECTION_CHANGE_DEG  = 30.0   # degrees — minimum angle change to insert a waypoint
+    MAX_TEMP_WAYPOINTS    = 10     # max number of intermediate waypoints from A*
+    UNKNOWN_AS_FREE       = True   # treat unknown cells (-1) as free for navigation
+```
+
+**Important notes:**
+- The map may be incomplete (SLAM is still building it). Unknown cells (value = -1) should be treated as free by default (`UNKNOWN_AS_FREE = True`) since the robot needs to explore through them.
+- If A* finds no path (completely blocked), log a warning and fall back to the Bug2 + forced rotation strategy.
+- This module has NO ROS2 Node inheritance — it is a pure logic class that receives the OccupancyGrid data and returns waypoints.
 
 ### `station_detector.py` — Charging station detection
 
@@ -471,13 +537,22 @@ class Config:
     KP_ANGULAR         = 1.2    # proportional gain for orientation
     KP_HEADING         = 0.4    # heading correction while moving
 
-    # Obstacle avoidance
+    # Obstacle avoidance (Bug2)
     DANGER_DIST        = 0.25   # m
     WARNING_DIST       = 0.45   # m
     SAFE_DIST          = 0.60   # m
     WALL_FOLLOW_DIST   = 0.35   # m — target lateral distance from wall
     WALL_FOLLOW_SPEED  = 0.10   # m/s
     KP_WALL            = 0.8
+    M_LINE_THRESHOLD   = 0.20   # m — tolerance to consider m-line crossed
+    DISTANCE_PROGRESS_MIN = 0.20 # m — min progress toward waypoint to exit avoidance
+
+    # Route planner (map-based fallback)
+    AVOIDANCE_TIMEOUT_S    = 30.0  # s — activate A* if avoidance active this long
+    INFLATE_RADIUS_M       = 0.15  # m — obstacle inflation for A* grid
+    OCCUPANCY_THRESHOLD    = 65    # grid value above this → occupied
+    MAX_WAYPOINT_SPACING   = 1.0   # m — max spacing between A* waypoints
+    MAX_TEMP_WAYPOINTS     = 10    # max intermediate waypoints from A*
 
     # Station detection
     CLUSTER_DIST       = 0.08   # m — max distance between adjacent scan points in same cluster
@@ -529,15 +604,16 @@ class Config:
 
 Provide the following files, fully implemented and ready to run:
 
-1. `mission_node.py` — main orchestrator with mission state machine
+1. `mission_node.py` — main orchestrator with mission state machine + map-based fallback integration
 2. `navigation.py` — waypoint navigator
-3. `obstacle_avoidance.py` — LiDAR processing, avoidance, wall-follow
-4. `station_detector.py` — pillar clustering and station geometry validation
-5. `docking.py` — precision docking controller
-6. `mission_logger.py` — CSV log writer
-7. `mission.launch.py` — ROS2 launch file
-8. `package.xml` — ROS2 package descriptor (Jazzy compatible: `<exec_depend>slam_toolbox</exec_depend>`, `<exec_depend>nav2_map_server</exec_depend>`)
-9. `setup.py` — Python package setup
+3. `obstacle_avoidance.py` — LiDAR processing, Bug2 avoidance, wall-follow with m-line exit
+4. `route_planner.py` — A* path planning on OccupancyGrid, temporary waypoint generation
+5. `station_detector.py` — pillar clustering and station geometry validation
+6. `docking.py` — precision docking controller
+7. `mission_logger.py` — CSV log writer
+8. `mission.launch.py` — ROS2 launch file
+9. `package.xml` — ROS2 package descriptor (Jazzy compatible: `<exec_depend>slam_toolbox</exec_depend>`, `<exec_depend>nav2_map_server</exec_depend>`)
+10. `setup.py` — Python package setup
 
 **Code quality requirements (graded):**
 - PEP8 compliant
@@ -566,7 +642,9 @@ Provide the following files, fully implemented and ready to run:
 
 - **Pillar detection at close range:** at 1 m distance, a 5 cm pillar subtends ~2.9°, which is ~3 scan points. At 2 m it's ~1.4° (~1–2 points). Cluster validation must account for this.
 
-- **Wall-follow exit:** do NOT exit wall-follow just because the front is clear — the robot may be in a gap in the wall. Also require that the heading toward the next waypoint is improving.
+- **Wall-follow exit (Bug2):** the primary exit condition is the **m-line crossing**: the robot must be close to the line between hit_point and waypoint AND be closer to the waypoint than when it started avoidance. The heading-improvement heuristic is kept as a fallback. Do NOT exit wall-follow just because the front is clear.
+
+- **Map-based route planning fallback:** if Bug2 avoidance has been active for more than `AVOIDANCE_TIMEOUT_S` without progress, use `route_planner.py` to compute A* waypoints on the SLAM map. This prevents the robot from getting stuck in dead-end rooms or complex corridors where Bug2 alone would loop indefinitely. The robot reverts to normal Bug2 navigation once all temporary waypoints are consumed.
 
 - **Station centering:** the interior of the station is 40×40 cm. The TB3 Burger is ~20 cm wide. Centering must be precise (< 3 cm error). Use live LiDAR feedback, not a stored position, during the final centering phase.
 
