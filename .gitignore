@@ -1,0 +1,16 @@
+# ROS 2 workspace ignores
+build/
+install/
+log/
+.vscode/
+
+# Python ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env/
+.venv/
