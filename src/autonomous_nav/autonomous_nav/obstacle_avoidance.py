@@ -1,153 +1,142 @@
 #!/usr/bin/env python3
 """
-obstacle_avoidance.py — LiDAR processing, sector classification and wall-follow controller.
+obstacle_avoidance.py — Bug2 reactive obstacle avoidance module (ROS2 Jazzy).
 
-Responsibilities:
-  - Parse raw /scan data into named angular sectors
-  - Classify each sector as SAFE / WARNING / DANGER
-  - Provide a wall-follow state machine for complex obstacle scenarios
-  - Expose a simple query API consumed by mission_node.py
+Implements the Bug2 algorithm:
 
-This module is a pure logic class (no ROS2 Node inheritance).
-It is instantiated by mission_node.py, which passes in LiDAR messages
-and retrieves velocity corrections.
+  FREE state  (navigation module controls):
+    · Monitor LiDAR sectors each tick.
+    · If FRONT / FRONT_RIGHT / FRONT_LEFT < WARNING_DIST:
+        - Record hit point  H(x, y)
+        - Define  m-line  = segment from H to the active goal waypoint
+        - Switch to WALL_FOLLOW
 
-State machine:
-    NORMAL       → nominal navigation, no obstacles in WARNING range
-    AVOID_ROTATE → obstacle in FRONT DANGER/WARNING; rotate toward free side
-    WALL_FOLLOW  → lateral tracking along the obstacle wall
-    RECOVERING   → front clear AND heading to waypoint improving → exit to NORMAL
+  WALL_FOLLOW state  (this module controls):
+    · Follow the wall on the RIGHT side (proportional lateral control).
+    · Turn LEFT in-place when FRONT is blocked.
+    · Bug2 exit conditions (both required):
+        1. Perpendicular distance to m-line  < M_LINE_THRESHOLD
+        2. dist(robot, goal) < dist(H, goal) − DISTANCE_PROGRESS_MIN
+    · Anti-stuck: if accumulated rotation is too low over STUCK_CHECK_TICKS,
+      apply a forced left rotation for STUCK_TURN_TICKS.
 
-Anti-stuck: if robot has not moved > STUCK_DIST_M in STUCK_TIME_S seconds,
-            force a 180° rotation (state FORCE_ROTATE).
+  DANGER (watchdog, caller fires at 50 Hz independently):
+    · is_front_danger() → True when FRONT min < DANGER_DIST.
+    · The caller (debug_nav_node) publishes a zero-velocity command directly.
+
+API (matches debug_nav_node.py / mission_node.py):
+    avoider = ObstacleAvoidance(logger=node.get_logger())
+    avoider.update_scan(scan_msg)          # /scan callback (BEST_EFFORT)
+    avoider.update_force_rotate(delta_yaw) # each control tick (|Δyaw| since last)
+    if avoider.is_front_danger(): ...      # 50 Hz watchdog
+    cmd, active = avoider.compute(x, y, yaw, wp_x, wp_y)
+    state_name  = avoider.get_state().name
+
+Compatibility:
+    · Pure-logic module — no ROS2 Node inheritance.
+    · Returns VelocityCommand (linear_x, angular_z); clamps to hard speed limits.
+    · Tested against ROS2 Jazzy + TB3 Burger LiDAR (LDS-01/02, 360 pts,
+      index 0 = front, CCW positive).
 """
 
 # ============================================================
-# CONFIGURATION — adjust these values for lab testing
+# CONFIGURATION
 # ============================================================
 class Config:
-    # Alert thresholds (metres)
-    DANGER_DIST         = 0.25   # immediate stop / hard avoidance
-    WARNING_DIST        = 0.45   # slow down, prepare avoidance
-    SAFE_DIST           = 0.60   # sector fully clear
+    """All tuneable parameters in one place — no magic numbers elsewhere."""
 
-    # Sector boundaries (degrees, robot-front = 0°, CCW positive)
-    #   stored as (min_deg, max_deg) inclusive
-    SECTOR_FRONT_DEG        = (-25.0,  25.0)
-    SECTOR_FRONT_LEFT_DEG   = ( 25.0,  70.0)
-    SECTOR_FRONT_RIGHT_DEG  = (-70.0, -25.0)
-    SECTOR_LEFT_DEG         = ( 70.0, 110.0)
-    SECTOR_RIGHT_DEG        = (-110.0, -70.0)
+    # --- Distance thresholds ---
+    DANGER_DIST           = 0.25   # m   — watchdog emergency threshold
+    WARNING_DIST          = 0.45   # m   — obstacle triggers avoidance entry
+    SAFE_DIST             = 0.60   # m   — considered open space
 
-    # Wall-follow parameters
-    WALL_FOLLOW_DIST    = 0.35   # m — target lateral distance from wall
-    WALL_FOLLOW_SPEED   = 0.10   # m/s — forward speed while wall-following
-    KP_WALL             = 0.8    # proportional gain for lateral error
-    MAX_WALL_ANGULAR    = 0.8    # rad/s — cap on wall-follow angular correction
+    # --- Wall following ---
+    WALL_FOLLOW_DIST      = 0.35   # m   — desired lateral distance to right wall
+    WALL_FOLLOW_SPEED     = 0.10   # m/s — forward speed during wall follow
+    KP_WALL               = 0.8    # —   — proportional gain for lateral error
+    TURN_SPEED            = 0.50   # rad/s — turn speed when front is blocked
+    CORNER_TURN_FACTOR    = 0.6    # —   — factor applied at front-right corner
 
-    # Rotation speeds during avoidance
-    AVOID_ANGULAR_SPEED = 0.50   # rad/s — speed when rotating away from obstacle
-    AVOID_LINEAR_SPEED  = 0.05   # m/s — creep forward during wall-follow
+    # --- Bug2 exit conditions ---
+    M_LINE_THRESHOLD      = 0.20   # m   — perpendicular dist to m-line for "on line"
+    DISTANCE_PROGRESS_MIN = 0.20   # m   — min extra progress toward goal to exit
+    MIN_TRAVEL_FROM_HIT   = 0.30   # m   — min distance from hit point before checking exit
 
-    # Heading-improvement window for RECOVERING exit condition
-    HEADING_WINDOW_S    = 2.0    # seconds of improvement required before exiting
+    # --- Anti-stuck ---
+    STUCK_CHECK_TICKS     = 40     # ticks (2 s @ 20 Hz) between stuck evaluations
+    STUCK_ROTATION_MIN    = 0.10   # rad  — min accumulated rotation to not be stuck
+    STUCK_TURN_TICKS      = 20     # ticks — forced left rotation when stuck detected
 
-    # Anti-stuck parameters
-    STUCK_DIST_M        = 0.05   # m — minimum displacement to not be considered stuck
-    STUCK_TIME_S        = 10.0    # s — time window for stuck detection
-    FORCE_ROTATE_ANGLE  = 3.14159  # rad ≈ 180°
-    FORCE_ROTATE_SPEED  = 0.50   # rad/s
+    # --- Exit cooldown (avoid immediately re-entering WALL_FOLLOW) ---
+    EXIT_COOLDOWN_TICKS   = 20     # ticks (~1 s @ 20 Hz)
 
-    # Bug2 Route Return Parameters
-    M_LINE_THRESHOLD    = 0.20   # m - wide margin to consider the "hit->target" line crossed
-    DISTANCE_PROGRESS_MIN = 0.20 # m - how much closer to target we must be to resume normal path
+    # --- Hard speed caps (safety — never exceed these) ---
+    LINEAR_MAX            = 0.20   # m/s
+    ANGULAR_MAX           = 1.00   # rad/s
 
-    # Minimum valid LiDAR range (metres) — below this, reading is likely noise
-    MIN_VALID_RANGE     = 0.12
+    # --- LiDAR sector boundaries [degrees, signed, TB3: 0=front, CCW+] ---
+    #   Tuple format: (start_deg, end_deg)  inclusive
+    FRONT_SECTOR          = (-20,  20)   # ±20° around front
+    FRONT_RIGHT_SECTOR    = (-60, -20)   # 20°–60° to the right of front
+    FRONT_LEFT_SECTOR     = ( 20,  60)   # 20°–60° to the left of front
+    RIGHT_SECTOR          = (-90, -60)   # pure right side
+    LEFT_SECTOR           = ( 60,  90)   # pure left side
 
 
 # ============================================================
 # IMPORTS
 # ============================================================
 import math
-import time
 from enum import Enum, auto
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
+
+try:
+    from sensor_msgs.msg import LaserScan          # available when ROS2 is sourced
+except ImportError:
+    LaserScan = None                               # standalone / unit-test fallback
 
 
 # ============================================================
 # ENUMERATIONS
 # ============================================================
-class AlertLevel(Enum):
-    """Classification of a LiDAR sector based on minimum detected distance."""
-    SAFE    = auto()
-    WARNING = auto()
-    DANGER  = auto()
-
-
 class AvoidState(Enum):
-    """Wall-follow / avoidance state machine states."""
-    NORMAL       = auto()   # regular navigation, no avoidance needed
-    AVOID_ROTATE = auto()   # rotating in place toward free side
-    WALL_FOLLOW  = auto()   # tracking lateral wall while moving forward
-    RECOVERING   = auto()   # front clear, heading improving — preparing to exit
-    FORCE_ROTATE = auto()   # anti-stuck: forced 180° rotation
+    """States of the Bug2 avoidance state machine."""
+    FREE        = auto()   # no active avoidance; navigation module drives
+    WALL_FOLLOW = auto()   # Bug2 wall-following active; this module drives
+    DANGER      = auto()   # emergency stop (fired by external watchdog)
 
 
 # ============================================================
-# DATA STRUCTURES
+# VELOCITY COMMAND
 # ============================================================
-class SectorData:
-    """
-    Holds the processed state of a single LiDAR sector.
-
-    Attributes:
-        name:        Human-readable sector name.
-        min_dist:    Minimum valid range in this sector [m].
-        mean_dist:   Mean of valid ranges in this sector [m].
-        alert:       AlertLevel classification.
-        n_points:    Number of valid scan points in this sector.
-    """
-
-    __slots__ = ('name', 'min_dist', 'mean_dist', 'alert', 'n_points')
-
-    def __init__(self, name: str) -> None:
-        self.name      = name
-        self.min_dist  = float('inf')
-        self.mean_dist = float('inf')
-        self.alert     = AlertLevel.SAFE
-        self.n_points  = 0
-
-    def classify(self) -> None:
-        """Set alert level based on min_dist and Config thresholds."""
-        if self.min_dist < Config.DANGER_DIST:
-            self.alert = AlertLevel.DANGER
-        elif self.min_dist < Config.WARNING_DIST:
-            self.alert = AlertLevel.WARNING
-        else:
-            self.alert = AlertLevel.SAFE
-
-    def __repr__(self) -> str:
-        return (f'SectorData({self.name}: min={self.min_dist:.3f}m '
-                f'alert={self.alert.name} pts={self.n_points})')
-
-
 class VelocityCommand:
-    """Simple container for a linear/angular velocity pair."""
+    """
+    Minimal container for a (linear_x, angular_z) velocity pair.
 
+    Identical interface to the one in navigation.py so that
+    mission_node / debug_nav_node can use both interchangeably.
+    """
     __slots__ = ('linear_x', 'angular_z')
 
     def __init__(self, linear_x: float = 0.0, angular_z: float = 0.0) -> None:
         self.linear_x  = linear_x
         self.angular_z = angular_z
 
-    @property
-    def is_stop(self) -> bool:
-        """True if both velocities are zero."""
-        return self.linear_x == 0.0 and self.angular_z == 0.0
-
     def __repr__(self) -> str:
         return f'VelocityCommand(lin={self.linear_x:.3f}, ang={self.angular_z:.3f})'
+
+
+# ============================================================
+# UTILITIES
+# ============================================================
+def _clamp(value: float, lo: float, hi: float) -> float:
+    """Clamp *value* to [lo, hi]."""
+    return max(lo, min(hi, value))
+
+
+def _valid_range(r: float) -> bool:
+    """Return True if *r* is a finite, positive LiDAR range."""
+    return math.isfinite(r) and r > 0.0
 
 
 # ============================================================
@@ -155,483 +144,492 @@ class VelocityCommand:
 # ============================================================
 class ObstacleAvoidance:
     """
-    LiDAR-based obstacle detection and wall-follow avoidance controller.
+    Bug2 reactive obstacle avoidance — pure logic module (no ROS2 Node).
 
-    Usage (from mission_node.py):
-        avoider = ObstacleAvoidance(logger=self.get_logger())
-        # on each /scan callback:
-        avoider.update_scan(scan_msg)
-        # on each control tick:
-        cmd, in_avoidance = avoider.compute(
-            current_x, current_y, current_yaw,
-            waypoint_x, waypoint_y
-        )
-        # emergency check (call from 50 Hz watchdog):
-        if avoider.is_front_danger():
-            publish_stop()
+    Instantiated once by the mission node and fed LiDAR + pose data each
+    control tick.  Returns velocity commands and an *in_avoidance* flag
+    that tells the caller whether to suppress its own navigation command.
+
+    Wall-follow side: RIGHT  (robot turns LEFT when front is blocked).
     """
 
     def __init__(self, logger=None) -> None:
         """
-        Initialise the avoidance controller.
+        Initialise the avoidance module.
 
         Args:
-            logger: A ROS2 logger (rclpy.impl.rcutils_logger.RcutilsLogger).
-                    If None, falls back to print() for standalone testing.
+            logger: ROS2 logger object (``node.get_logger()``) or None
+                    (falls back to ``print``).
         """
         self._log = logger
 
-        # Sector containers — keyed by sector name
-        self._sectors: Dict[str, SectorData] = {
-            'FRONT':       SectorData('FRONT'),
-            'FRONT_LEFT':  SectorData('FRONT_LEFT'),
-            'FRONT_RIGHT': SectorData('FRONT_RIGHT'),
-            'LEFT':        SectorData('LEFT'),
-            'RIGHT':       SectorData('RIGHT'),
-        }
+        # ---- State machine ----
+        self._state = AvoidState.FREE
 
-        # Raw LiDAR snapshot (list of (angle_rad, range_m) for valid readings)
-        self._valid_points: List[Tuple[float, float]] = []
+        # ---- Latest LiDAR sector minimums ----
+        self._front_min       = float('inf')
+        self._front_right_min = float('inf')
+        self._front_left_min  = float('inf')
+        self._right_min       = float('inf')
+        self._left_min        = float('inf')
+        self._scan_ready      = False
 
-        # Avoidance state machine
-        self._state      = AvoidState.NORMAL
-        self._wall_side  = 'LEFT'   # side we are wall-following ('LEFT' or 'RIGHT')
+        # ---- Bug2 m-line data (set when avoidance starts) ----
+        self._hit_x: float            = 0.0
+        self._hit_y: float            = 0.0
+        self._hit_dist_to_goal: float = float('inf')
+        self._goal_x: Optional[float] = None
+        self._goal_y: Optional[float] = None
 
-        # Heading improvement tracking for RECOVERING exit
-        self._heading_history: List[Tuple[float, float]] = []  # (timestamp, abs_angle_error)
+        # ---- Anti-stuck ----
+        self._rotation_accum:   float = 0.0
+        self._rotation_ticks:   int   = 0
+        self._stuck_count:      int   = 0
+        self._force_turn_ticks: int   = 0   # countdown; > 0 → forced turn active
 
-        # Anti-stuck tracking
-        self._last_move_time  = time.time()
-        self._last_check_pos  = (0.0, 0.0)
-        self._stuck_rotating  = False
-        self._force_rot_accumulated = 0.0   # radians rotated so far
+        # ---- Exit cooldown (avoids instant re-entry after leaving WALL_FOLLOW) ----
+        self._exit_cooldown: int = 0
 
-        # Scan metadata
-        self._scan_stamp  = 0.0
-        self._range_min   = Config.MIN_VALID_RANGE
-        self._range_max   = 3.5
+    # ==========================================================
+    # PUBLIC API
+    # ==========================================================
 
-        # Bug2 tracking
-        self._hit_x = 0.0
-        self._hit_y = 0.0
-        self._wp_hit_x = 0.0
-        self._wp_hit_y = 0.0
-
-    # ----------------------------------------------------------
-    # Public API — called from mission_node.py
-    # ----------------------------------------------------------
-
-    def update_scan(self, scan_msg) -> None:
+    def update_scan(self, msg: LaserScan) -> None:
         """
-        Ingest a new LaserScan message and recompute all sector states.
+        Ingest a new LaserScan and update per-sector minimum distances.
 
-        This is the only method that reads the ROS2 message type.
-        All other methods work on the pre-processed internal state.
+        NaN and Inf values are filtered before any comparison.
+        Must be called from the /scan subscriber callback.
 
         Args:
-            scan_msg: sensor_msgs/LaserScan message.
+            msg: ``sensor_msgs/LaserScan`` from /scan (BEST_EFFORT QoS).
         """
-        self._range_min  = scan_msg.range_min
-        self._range_max  = scan_msg.range_max
-        self._scan_stamp = time.time()
+        ranges = msg.ranges
+        n      = len(ranges)
 
-        valid: List[Tuple[float, float]] = []
-
-        # Reset sectors
-        for s in self._sectors.values():
-            s.min_dist  = float('inf')
-            s.mean_dist = float('inf')
-            s.n_points  = 0
-
-        sector_sums: Dict[str, float] = {k: 0.0 for k in self._sectors}
-
-        for i, r in enumerate(scan_msg.ranges):
-            # --- NaN / Inf guard ---
-            if math.isnan(r) or math.isinf(r):
-                continue
-            if r < self._range_min or r > self._range_max:
-                continue
-
-            angle_rad = scan_msg.angle_min + i * scan_msg.angle_increment
-            angle_deg = math.degrees(self._normalize_angle(angle_rad))
-
-            valid.append((angle_rad, r))
-
-            # Assign to sector
-            sector_name = self._angle_to_sector(angle_deg)
-            if sector_name is None:
-                continue
-
-            s = self._sectors[sector_name]
-            if r < s.min_dist:
-                s.min_dist = r
-            sector_sums[sector_name] += r
-            s.n_points += 1
-
-        # Compute means and classify
-        for name, s in self._sectors.items():
-            if s.n_points > 0:
-                s.mean_dist = sector_sums[name] / s.n_points
-            else:
-                s.min_dist  = float('inf')
-                s.mean_dist = float('inf')
-            s.classify()
-
-        self._valid_points = valid
-
-    def compute(
-        self,
-        robot_x: float,
-        robot_y: float,
-        robot_yaw: float,
-        waypoint_x: float,
-        waypoint_y: float,
-    ) -> Tuple[VelocityCommand, bool]:
-        """
-        Run the avoidance state machine and return a velocity command.
-
-        Returns:
-            (VelocityCommand, in_avoidance: bool)
-            in_avoidance is True whenever the state is not NORMAL,
-            signalling mission_node.py to suspend its own navigation.
-        """
-        self._update_stuck(robot_x, robot_y)
-        self._update_state(robot_x, robot_y, robot_yaw, waypoint_x, waypoint_y)
-        cmd = self._compute_command(robot_yaw, waypoint_x, waypoint_y)
-        in_avoidance = self._state != AvoidState.NORMAL
-        return cmd, in_avoidance
-
-    def is_front_danger(self) -> bool:
-        """
-        Return True if the FRONT sector is at DANGER level.
-
-        Used by the 50 Hz safety watchdog in mission_node.py.
-        """
-        return self._sectors['FRONT'].alert == AlertLevel.DANGER
-
-    def get_sectors(self) -> Dict[str, SectorData]:
-        """Return a snapshot of all sector states (read-only reference)."""
-        return self._sectors
-
-    def get_state(self) -> AvoidState:
-        """Return the current avoidance state."""
-        return self._state
-
-    def reset(self) -> None:
-        """Force-reset to NORMAL state (call after waypoint arrival)."""
-        self._state = AvoidState.NORMAL
-        self._heading_history.clear()
-
-    # ----------------------------------------------------------
-    # State machine transitions
-    # ----------------------------------------------------------
-
-    def _update_state(
-        self,
-        robot_x: float,
-        robot_y: float,
-        robot_yaw: float,
-        wp_x: float,
-        wp_y: float,
-    ) -> None:
-        """Evaluate transitions between avoidance states."""
-
-        # Anti-stuck takes highest priority (below the watchdog stop)
-        if self._state == AvoidState.FORCE_ROTATE:
-        	# Exit when 180° has been accumulated
-        	if self._force_rot_accumulated >= Config.FORCE_ROTATE_ANGLE:
-        		self._force_rot_accumulated = 0.0
-        		# Reset anti-stuck tracker so no re-trigger immediately
-        		self._last_move_time = time.time()
-        		self._last_check_pos = (robot_x, robot_y)
-        		self._transition(AvoidState.NORMAL)
-        	return
-
-        front   = self._sectors['FRONT']
-        f_left  = self._sectors['FRONT_LEFT']
-        f_right = self._sectors['FRONT_RIGHT']
-
-        if self._state == AvoidState.NORMAL:
-            if front.alert in (AlertLevel.DANGER, AlertLevel.WARNING):
-                self._wall_side = self._choose_wall_side()
-                # Store Bug2 hit point and waypoint
-                self._hit_x = robot_x
-                self._hit_y = robot_y
-                self._wp_hit_x = wp_x
-                self._wp_hit_y = wp_y
-                self._transition(AvoidState.AVOID_ROTATE)
-
-        elif self._state == AvoidState.AVOID_ROTATE:
-            # Exit rotate when front is clear
-            if front.alert == AlertLevel.SAFE:
-                self._transition(AvoidState.WALL_FOLLOW)
-
-        elif self._state == AvoidState.WALL_FOLLOW:
-            if front.alert in (AlertLevel.DANGER, AlertLevel.WARNING):
-                # Hit another obstacle — re-rotate
-                self._wall_side = self._choose_wall_side()
-                self._transition(AvoidState.AVOID_ROTATE)
-            elif front.alert == AlertLevel.SAFE:
-                if self._is_on_m_line(robot_x, robot_y, wp_x, wp_y):
-                    self._transition(AvoidState.NORMAL)
-                else:
-                    self._transition(AvoidState.RECOVERING)
-
-        elif self._state == AvoidState.RECOVERING:
-            if front.alert in (AlertLevel.DANGER, AlertLevel.WARNING):
-                self._wall_side = self._choose_wall_side()
-                self._transition(AvoidState.AVOID_ROTATE)
-                return
-
-            # Check Bug2 exit condition
-            if self._is_on_m_line(robot_x, robot_y, wp_x, wp_y):
-                self._transition(AvoidState.NORMAL)
-                return
-
-            # Track heading improvement (fallback check)
-            abs_err = abs(self._angle_to_waypoint(robot_x, robot_y, robot_yaw, wp_x, wp_y))
-            now = time.time()
-            self._heading_history.append((now, abs_err))
-            # Prune old entries
-            cutoff = now - Config.HEADING_WINDOW_S
-            self._heading_history = [(t, e) for t, e in self._heading_history if t >= cutoff]
-
-            if self._heading_is_improving():
-                self._heading_history.clear()
-                self._transition(AvoidState.NORMAL)
-
-    def _compute_command(
-        self,
-        robot_yaw: float,
-        wp_x: float,
-        wp_y: float,
-    ) -> VelocityCommand:
-        """Map the current state to a concrete VelocityCommand."""
-
-        if self._state == AvoidState.NORMAL:
-            return VelocityCommand(0.0, 0.0)   # navigation.py handles motion
-
-        elif self._state == AvoidState.AVOID_ROTATE:
-            direction = 1.0 if self._wall_side == 'LEFT' else -1.0
-            return VelocityCommand(0.0, direction * Config.AVOID_ANGULAR_SPEED)
-
-        elif self._state == AvoidState.WALL_FOLLOW:
-            return self._wall_follow_command()
-
-        elif self._state == AvoidState.RECOVERING:
-            return self._wall_follow_command()   # keep wall-following until safe
-
-        elif self._state == AvoidState.FORCE_ROTATE:
-            return VelocityCommand(0.0, Config.FORCE_ROTATE_SPEED)
-
-        return VelocityCommand(0.0, 0.0)
-
-    # ----------------------------------------------------------
-    # Wall-follow lateral control
-    # ----------------------------------------------------------
-
-    def _wall_follow_command(self) -> VelocityCommand:
-        """
-        Compute forward + lateral-correction command for wall-following.
-
-        Lateral error = lateral_sector_min_dist − WALL_FOLLOW_DIST
-        angular_correction = Kp_wall * lateral_error
-        (positive error → too far from wall → turn toward wall)
-        """
-        if self._wall_side == 'LEFT':
-            lateral_dist = self._sectors['LEFT'].min_dist
-            sign = 1.0   # positive angular = turn left = toward left wall
-        else:
-            lateral_dist = self._sectors['RIGHT'].min_dist
-            sign = -1.0  # negative angular = turn right = toward right wall
-
-        if math.isinf(lateral_dist):
-            # No wall on tracking side — just creep forward
-            return VelocityCommand(Config.WALL_FOLLOW_SPEED, 0.0)
-
-        lateral_error = lateral_dist - Config.WALL_FOLLOW_DIST
-        angular_corr  = sign * Config.KP_WALL * lateral_error
-        angular_corr  = max(-Config.MAX_WALL_ANGULAR,
-                            min(Config.MAX_WALL_ANGULAR, angular_corr))
-
-        return VelocityCommand(Config.WALL_FOLLOW_SPEED, angular_corr)
-
-    # ----------------------------------------------------------
-    # Bug2 line check
-    # ----------------------------------------------------------
-
-    def _is_on_m_line(self, rx: float, ry: float, wp_x: float, wp_y: float) -> bool:
-        """
-        Check if the robot is close to the line from hit_point to waypoint,
-        and is also strictly closer to the goal than the hit_point was.
-        """
-        if wp_x != self._wp_hit_x or wp_y != self._wp_hit_y:
-            return False
-
-        x1, y1 = self._hit_x, self._hit_y
-        x2, y2 = wp_x, wp_y
-
-        num = abs((y2 - y1)*rx - (x2 - x1)*ry + x2*y1 - y2*x1)
-        den = math.sqrt((y2 - y1)**2 + (x2 - x1)**2)
-
-        if den < 1e-6:
-            return False
-
-        dist_to_line = num / den
-
-        dist_to_wp_now = math.sqrt((wp_x - rx)**2 + (wp_y - ry)**2)
-        dist_to_wp_hit = math.sqrt((wp_x - x1)**2 + (wp_y - y1)**2)
-
-        progress = dist_to_wp_hit - dist_to_wp_now
-
-        return dist_to_line < Config.M_LINE_THRESHOLD and progress > Config.DISTANCE_PROGRESS_MIN
-
-    # ----------------------------------------------------------
-    # Helper: side selection
-    # ----------------------------------------------------------
-
-    def _choose_wall_side(self) -> str:
-        """
-        Choose the wall-follow side as the side with MORE free space
-        (higher minimum distance in the lateral sector).
-
-        Returns: 'LEFT' or 'RIGHT'
-        """
-        left_dist  = self._sectors['LEFT'].min_dist
-        right_dist = self._sectors['RIGHT'].min_dist
-
-        # If one side is completely clear (inf) prefer it
-        if math.isinf(left_dist) and not math.isinf(right_dist):
-            return 'LEFT'
-        if math.isinf(right_dist) and not math.isinf(left_dist):
-            return 'RIGHT'
-
-        return 'LEFT' if left_dist >= right_dist else 'RIGHT'
-
-    # ----------------------------------------------------------
-    # Helper: anti-stuck
-    # ----------------------------------------------------------
-
-    def _update_stuck(self, robot_x: float, robot_y: float) -> None:
-        """
-        Detect if the robot has not moved for STUCK_TIME_S seconds and,
-        if so, transition to FORCE_ROTATE.
-        """
-        now = time.time()
-        dx = robot_x - self._last_check_pos[0]
-        dy = robot_y - self._last_check_pos[1]
-        dist = math.sqrt(dx * dx + dy * dy)
-
-        if dist > Config.STUCK_DIST_M:
-            self._last_move_time  = now
-            self._last_check_pos  = (robot_x, robot_y)
-
-        if (now - self._last_move_time > Config.STUCK_TIME_S
-                and self._state != AvoidState.FORCE_ROTATE):
-            self._log_warn('[AVOID] ⚠ Anti-stuck! Robot bloquejat — rotació forçada 180°')
-            self._force_rot_accumulated = 0.0
-            self._transition(AvoidState.FORCE_ROTATE)
+        self._front_min       = self._sector_min(ranges, n, *Config.FRONT_SECTOR)
+        self._front_right_min = self._sector_min(ranges, n, *Config.FRONT_RIGHT_SECTOR)
+        self._front_left_min  = self._sector_min(ranges, n, *Config.FRONT_LEFT_SECTOR)
+        self._right_min       = self._sector_min(ranges, n, *Config.RIGHT_SECTOR)
+        self._left_min        = self._sector_min(ranges, n, *Config.LEFT_SECTOR)
+        self._scan_ready      = True
 
     def update_force_rotate(self, delta_yaw: float) -> None:
         """
-        Accumulate rotated angle during FORCE_ROTATE state.
+        Update the anti-stuck rotation accumulator.
 
-        Call this from mission_node.py every control tick, passing the
-        absolute yaw change since last tick (always positive).
+        Should be called once per control tick (20 Hz) with the absolute
+        yaw change since the previous tick.  Only active in WALL_FOLLOW.
 
         Args:
-            delta_yaw: Absolute yaw change in radians this tick.
+            delta_yaw: ``|yaw_now − yaw_prev|`` [rad], already normalised ≥ 0.
         """
-        if self._state == AvoidState.FORCE_ROTATE:
-            self._force_rot_accumulated += abs(delta_yaw)
+        if self._state != AvoidState.WALL_FOLLOW:
+            # Reset accumulator when not wall-following
+            self._rotation_accum = 0.0
+            self._rotation_ticks = 0
+            return
 
-    # ----------------------------------------------------------
-    # Helper: heading improvement check
-    # ----------------------------------------------------------
+        self._rotation_accum += abs(delta_yaw)
+        self._rotation_ticks += 1
 
-    def _heading_is_improving(self) -> bool:
+        if self._rotation_ticks >= Config.STUCK_CHECK_TICKS:
+            if self._rotation_accum < Config.STUCK_ROTATION_MIN:
+                self._stuck_count      += 1
+                self._force_turn_ticks  = Config.STUCK_TURN_TICKS
+                self._log_warn(
+                    f'[AVOID] Anti-stuck triggered '
+                    f'(accumulated={self._rotation_accum:.3f} rad < '
+                    f'{Config.STUCK_ROTATION_MIN} rad, count={self._stuck_count})'
+                )
+            else:
+                self._stuck_count = max(0, self._stuck_count - 1)
+
+            # Reset period counters
+            self._rotation_accum = 0.0
+            self._rotation_ticks = 0
+
+    def is_front_danger(self) -> bool:
         """
-        Return True if the heading error has been monotonically decreasing
-        over the last HEADING_WINDOW_S seconds.
+        Return True when the FRONT sector has a reading below DANGER_DIST.
 
-        Requires at least 3 data points.
+        Called by the external watchdog timer at 50 Hz.  The caller is
+        responsible for publishing a zero-velocity TwistStamped when True.
         """
-        if len(self._heading_history) < 3:
+        return self._scan_ready and (self._front_min < Config.DANGER_DIST)
+
+    def compute(
+        self,
+        x:    float,
+        y:    float,
+        yaw:  float,
+        wp_x: float,
+        wp_y: float,
+    ) -> Tuple[VelocityCommand, bool]:
+        """
+        Compute the Bug2 avoidance velocity command for this control tick.
+
+        Call once per tick (20 Hz) from the mission node control loop.
+        When *in_avoidance* is True the caller must publish the returned
+        command and suppress its own navigation command.
+
+        Args:
+            x:    Robot X position [m] (SLAM or odometry).
+            y:    Robot Y position [m].
+            yaw:  Robot heading    [rad].
+            wp_x: Active goal waypoint X [m].
+            wp_y: Active goal waypoint Y [m].
+
+        Returns:
+            Tuple ``(cmd, in_avoidance)``:
+              · ``cmd``          — VelocityCommand(linear_x, angular_z),
+                                   clamped to hard speed limits.
+              · ``in_avoidance`` — True  → WALL_FOLLOW active; caller must
+                                           use this command.
+                                   False → FREE; caller may use its own cmd.
+        """
+        if not self._scan_ready:
+            return VelocityCommand(0.0, 0.0), False
+
+        # Update cached goal
+        self._goal_x = wp_x
+        self._goal_y = wp_y
+
+        # Tick down cooldown counter
+        if self._exit_cooldown > 0:
+            self._exit_cooldown -= 1
+
+        if self._state == AvoidState.FREE:
+            return self._step_free(x, y, yaw, wp_x, wp_y)
+
+        if self._state == AvoidState.WALL_FOLLOW:
+            return self._step_wall_follow(x, y, yaw, wp_x, wp_y)
+
+        # DANGER is handled externally by the watchdog
+        return VelocityCommand(0.0, 0.0), False
+
+    def get_state(self) -> AvoidState:
+        """Return the current ``AvoidState`` enum value."""
+        return self._state
+
+    def reset(self) -> None:
+        """
+        Reset to FREE state.
+
+        Call this whenever a new waypoint is set (e.g. from mission_node)
+        so stale hit-point data from the previous segment is discarded.
+        """
+        self._state             = AvoidState.FREE
+        self._exit_cooldown     = 0
+        self._stuck_count       = 0
+        self._force_turn_ticks  = 0
+        self._rotation_accum    = 0.0
+        self._rotation_ticks    = 0
+        self._hit_dist_to_goal  = float('inf')
+        self._log_info('[AVOID] State reset → FREE')
+
+    # ==========================================================
+    # STATE: FREE
+    # ==========================================================
+
+    def _step_free(
+        self,
+        x: float, y: float, yaw: float,
+        wp_x: float, wp_y: float,
+    ) -> Tuple[VelocityCommand, bool]:
+        """
+        FREE state handler.
+
+        Monitors the three forward sectors.  When an obstacle is detected
+        within WARNING_DIST and the exit cooldown has expired, records the
+        hit point, defines the m-line, and transitions to WALL_FOLLOW.
+
+        Returns:
+            ``(zero_cmd, False)`` while free.
+            ``(first_wall_cmd, True)`` on the tick avoidance starts.
+        """
+        # Respect post-exit cooldown to avoid oscillation
+        if self._exit_cooldown > 0:
+            return VelocityCommand(0.0, 0.0), False
+
+        # Obstacle detected in any of the three forward sectors
+        front_blocked = (
+            self._front_min       < Config.WARNING_DIST or
+            self._front_right_min < Config.WARNING_DIST or
+            self._front_left_min  < Config.WARNING_DIST
+        )
+
+        if not front_blocked:
+            return VelocityCommand(0.0, 0.0), False
+
+        # ---- Transition to WALL_FOLLOW ----
+        dist_to_goal = math.sqrt((x - wp_x) ** 2 + (y - wp_y) ** 2)
+
+        self._hit_x            = x
+        self._hit_y            = y
+        self._hit_dist_to_goal = dist_to_goal
+        self._state            = AvoidState.WALL_FOLLOW
+        self._stuck_count      = 0
+        self._rotation_accum   = 0.0
+        self._rotation_ticks   = 0
+        self._force_turn_ticks = 0
+
+        self._log_info(
+            f'[AVOID] FREE → WALL_FOLLOW  '
+            f'hit=({x:.2f}, {y:.2f})  '
+            f'dist_to_goal={dist_to_goal:.2f} m  '
+            f'front_min={self._front_min:.2f} m'
+        )
+
+        # Issue the first wall-follow command on this same tick
+        return self._step_wall_follow(x, y, yaw, wp_x, wp_y)
+
+    # ==========================================================
+    # STATE: WALL_FOLLOW
+    # ==========================================================
+
+    def _step_wall_follow(
+        self,
+        x: float, y: float, yaw: float,
+        wp_x: float, wp_y: float,
+    ) -> Tuple[VelocityCommand, bool]:
+        """
+        WALL_FOLLOW state handler — Bug2 wall-following controller.
+
+        Follows the wall on the RIGHT side.  Checks the Bug2 m-line exit
+        condition each tick.  Handles the anti-stuck override.
+
+        Returns:
+            ``(cmd, True)`` — avoidance is active; caller must use this command.
+        """
+        # ---- Anti-stuck forced rotation override ----
+        if self._force_turn_ticks > 0:
+            self._force_turn_ticks -= 1
+            cmd = VelocityCommand(
+                0.0,
+                _clamp(Config.TURN_SPEED, -Config.ANGULAR_MAX, Config.ANGULAR_MAX),
+            )
+            return cmd, True
+
+        # ---- Check Bug2 exit condition ----
+        if self._check_mline_exit(x, y, wp_x, wp_y):
+            dist_final = math.sqrt((x - wp_x) ** 2 + (y - wp_y) ** 2)
+            self._state         = AvoidState.FREE
+            self._exit_cooldown = Config.EXIT_COOLDOWN_TICKS
+            self._log_info(
+                f'[AVOID] WALL_FOLLOW → FREE (m-line crossed)  '
+                f'pos=({x:.2f}, {y:.2f})  '
+                f'dist_to_goal={dist_final:.2f} m'
+            )
+            return VelocityCommand(0.0, 0.0), False
+
+        # ---- Compute wall-follow velocity command ----
+        cmd = self._wall_follow_cmd()
+        return cmd, True
+
+    def _wall_follow_cmd(self) -> VelocityCommand:
+        """
+        Proportional wall-following velocity command (wall on RIGHT side).
+
+        Priority (highest first):
+          1. FRONT < WARNING_DIST  → stop + turn left in place.
+          2. FRONT_RIGHT < WARNING_DIST  → corner ahead; slow + bear left.
+          3. Normal follow  → proportional lateral distance control:
+               - too far from wall  → turn right (negative angular_z)
+               - too close to wall  → turn left  (positive angular_z)
+          4. No wall found on right (open space)  → lean right to find wall.
+
+        Returns:
+            VelocityCommand clamped to hard speed limits.
+        """
+        # Case 1: Front blocked — turn left in-place
+        if self._front_min < Config.WARNING_DIST:
+            return VelocityCommand(
+                0.0,
+                _clamp(Config.TURN_SPEED, -Config.ANGULAR_MAX, Config.ANGULAR_MAX),
+            )
+
+        # Case 2: Front-right corner approaching — reduce speed, bear left
+        if self._front_right_min < Config.WARNING_DIST:
+            return VelocityCommand(
+                _clamp(
+                    Config.WALL_FOLLOW_SPEED * 0.5,
+                    0.0, Config.LINEAR_MAX,
+                ),
+                _clamp(
+                    Config.TURN_SPEED * Config.CORNER_TURN_FACTOR,
+                    -Config.ANGULAR_MAX, Config.ANGULAR_MAX,
+                ),
+            )
+
+        # Case 3: Normal proportional wall-follow
+        #   lateral_error > 0  → too close  → turn left  (+angular_z)
+        #   lateral_error < 0  → too far    → turn right (−angular_z)
+        lateral_error = Config.WALL_FOLLOW_DIST - self._right_min
+        angular_z     = _clamp(
+            Config.KP_WALL * lateral_error,
+            -Config.ANGULAR_MAX,
+            Config.ANGULAR_MAX,
+        )
+
+        # Case 4: Right wall completely absent — lean right to search for wall
+        if self._right_min > Config.SAFE_DIST * 1.5:
+            angular_z = _clamp(
+                -Config.TURN_SPEED * 0.4,
+                -Config.ANGULAR_MAX, Config.ANGULAR_MAX,
+            )
+
+        return VelocityCommand(
+            _clamp(Config.WALL_FOLLOW_SPEED, 0.0, Config.LINEAR_MAX),
+            angular_z,
+        )
+
+    # ==========================================================
+    # BUG2 EXIT CONDITION
+    # ==========================================================
+
+    def _check_mline_exit(
+        self, x: float, y: float, wp_x: float, wp_y: float
+    ) -> bool:
+        """
+        Evaluate the Bug2 m-line exit condition.
+
+        The robot exits WALL_FOLLOW when **all** of the following hold:
+
+        1. It has travelled at least MIN_TRAVEL_FROM_HIT from the hit point
+           (prevents exiting immediately after entry).
+        2. Its perpendicular distance to the m-line (segment hit → goal) is
+           below M_LINE_THRESHOLD (robot is on the line).
+        3. Its distance to the goal is at least DISTANCE_PROGRESS_MIN less
+           than the distance from the hit point to the goal (robot is making
+           progress — not just circling back past the start of avoidance).
+
+        Args:
+            x, y:       Current robot position [m].
+            wp_x, wp_y: Active goal waypoint [m].
+
+        Returns:
+            True if all exit conditions are satisfied.
+        """
+        # Condition 0: must have moved away from hit point
+        dist_from_hit = math.sqrt(
+            (x - self._hit_x) ** 2 + (y - self._hit_y) ** 2
+        )
+        if dist_from_hit < Config.MIN_TRAVEL_FROM_HIT:
             return False
-        errors = [e for _, e in self._heading_history]
-        # Improving = last sample is smaller than the first in the window
-        return errors[-1] < errors[0] - 0.05   # 0.05 rad hysteresis
 
-    # ----------------------------------------------------------
-    # Helper: angle to waypoint (in robot frame)
-    # ----------------------------------------------------------
+        # Condition 1: perpendicular distance to m-line
+        d_mline = self._mline_distance(x, y, wp_x, wp_y)
+        if d_mline > Config.M_LINE_THRESHOLD:
+            return False
 
-    @staticmethod
-    def _angle_to_waypoint(
-        rx: float, ry: float, ryaw: float,
-        wx: float, wy: float,
+        # Condition 2: closer to goal than the hit point was
+        dist_to_goal = math.sqrt((x - wp_x) ** 2 + (y - wp_y) ** 2)
+        progress = self._hit_dist_to_goal - dist_to_goal
+        if progress < Config.DISTANCE_PROGRESS_MIN:
+            return False
+
+        self._log_info(
+            f'[AVOID] Exit conditions met  '
+            f'd_mline={d_mline:.3f} m  progress={progress:.3f} m'
+        )
+        return True
+
+    def _mline_distance(
+        self, rx: float, ry: float, gx: float, gy: float
     ) -> float:
         """
-        Compute the signed angle from the robot's current heading to the
-        direction toward waypoint (wx, wy), normalised to [-π, π].
-        """
-        desired_yaw = math.atan2(wy - ry, wx - rx)
-        error = desired_yaw - ryaw
-        # Normalise
-        while error >  math.pi: error -= 2 * math.pi
-        while error < -math.pi: error += 2 * math.pi
-        return error
+        Perpendicular distance from robot (rx, ry) to the m-line.
 
-    # ----------------------------------------------------------
-    # Helper: sector mapping
-    # ----------------------------------------------------------
+        The m-line is the infinite line passing through the hit point H
+        and the goal G.  Using the cross-product formula:
+
+            d = |(robot − H) × (G − H)| / |G − H|
+
+        Args:
+            rx, ry: Robot position [m].
+            gx, gy: Goal waypoint  [m].
+
+        Returns:
+            Perpendicular distance [m].
+        """
+        hx, hy = self._hit_x, self._hit_y
+        dx     = gx - hx
+        dy     = gy - hy
+        length = math.sqrt(dx * dx + dy * dy)
+
+        if length < 0.01:
+            # Degenerate: hit point ≈ goal (robot is already there)
+            return math.sqrt((rx - gx) ** 2 + (ry - gy) ** 2)
+
+        cross = (rx - hx) * dy - (ry - hy) * dx
+        return abs(cross) / length
+
+    # ==========================================================
+    # LIDAR SECTOR HELPER
+    # ==========================================================
 
     @staticmethod
-    def _angle_to_sector(angle_deg: float) -> Optional[str]:
+    def _sector_min(
+        ranges: 'list[float]',
+        n:      int,
+        start_deg: int,
+        end_deg:   int,
+    ) -> float:
         """
-        Map a bearing in degrees (robot-front = 0°, CCW positive, range [-180, 180])
-        to a sector name, or None if it falls outside all defined sectors.
+        Minimum valid range reading within a named LiDAR sector.
+
+        Handles wrap-around sectors (e.g. FRONT spans 340°–20°).
+        TB3 LiDAR convention: index 0 = front, CCW positive.
+        Signed degree input is normalised to [0, 360) via modulo.
+
+        Args:
+            ranges:    LaserScan.ranges (full 360 array).
+            n:         len(ranges) — typically 360.
+            start_deg: Sector start angle [deg, signed].
+            end_deg:   Sector end   angle [deg, signed].
+
+        Returns:
+            Minimum valid range [m], or ``inf`` when the sector is empty
+            or all readings are NaN / Inf.
         """
-        a = angle_deg
-        fl_min, fl_max = Config.SECTOR_FRONT_LEFT_DEG
-        fr_min, fr_max = Config.SECTOR_FRONT_RIGHT_DEG
-        f_min,  f_max  = Config.SECTOR_FRONT_DEG
-        l_min,  l_max  = Config.SECTOR_LEFT_DEG
-        r_min,  r_max  = Config.SECTOR_RIGHT_DEG
+        start_idx = int(start_deg % 360)   # e.g. -20 → 340
+        end_idx   = int(end_deg   % 360)   # e.g.  20 →  20
 
-        if f_min  <= a <= f_max:  return 'FRONT'
-        if fl_min <= a <= fl_max: return 'FRONT_LEFT'
-        if fr_min <= a <= fr_max: return 'FRONT_RIGHT'
-        if l_min  <= a <= l_max:  return 'LEFT'
-        if r_min  <= a <= r_max:  return 'RIGHT'
-        return None
+        minimum = float('inf')
 
-    @staticmethod
-    def _normalize_angle(angle: float) -> float:
-        """Normalise an angle in radians to [-π, π]."""
-        while angle >  math.pi: angle -= 2 * math.pi
-        while angle < -math.pi: angle += 2 * math.pi
-        return angle
+        if start_idx <= end_idx:
+            # Contiguous sector — no wrap (e.g. 20°–60°, 270°–300°)
+            for i in range(start_idx, end_idx + 1):
+                r = ranges[i % n]
+                if _valid_range(r) and r < minimum:
+                    minimum = r
+        else:
+            # Sector wraps through 0° / 360° (e.g. 340°–20° for FRONT)
+            for i in range(start_idx, n):
+                r = ranges[i % n]
+                if _valid_range(r) and r < minimum:
+                    minimum = r
+            for i in range(0, end_idx + 1):
+                r = ranges[i % n]
+                if _valid_range(r) and r < minimum:
+                    minimum = r
 
-    # ----------------------------------------------------------
-    # Logging helpers
-    # ----------------------------------------------------------
+        return minimum
 
-    def _transition(self, new_state: AvoidState) -> None:
-        """Log and perform a state transition."""
-        if new_state != self._state:
-            self._log_info(
-                f'[AVOID] {self._state.name} → {new_state.name}'
-            )
-            self._state = new_state
+    # ==========================================================
+    # LOGGING HELPERS
+    # ==========================================================
 
     def _log_info(self, msg: str) -> None:
+        """Log at INFO level (ROS2 logger or print fallback)."""
         if self._log:
             self._log.info(msg)
         else:
             print(f'[INFO] {msg}')
 
     def _log_warn(self, msg: str) -> None:
+        """Log at WARN level (ROS2 logger or print fallback)."""
         if self._log:
             self._log.warning(msg)
         else:
@@ -639,52 +637,77 @@ class ObstacleAvoidance:
 
 
 # ============================================================
-# STANDALONE TEST (no ROS2 required)
+# STANDALONE SMOKE TEST  (no ROS2 required)
 # ============================================================
 if __name__ == '__main__':
     import math
 
+    print('=== ObstacleAvoidance — standalone smoke test ===\n')
+
+    # ---- Dummy LaserScan builder ----
     class FakeScan:
-        """Minimal LaserScan mock for unit testing."""
-        def __init__(self, n=360, obstacle_angle_deg=0, obstacle_dist=0.30):
-            self.range_min = 0.12
-            self.range_max = 3.50
-            self.angle_min = -math.pi
-            self.angle_increment = 2 * math.pi / n
-            self.ranges = [3.0] * n
-            # Plant one obstacle
-            idx = int((math.radians(obstacle_angle_deg) - self.angle_min)
-                      / self.angle_increment) % n
-            for di in range(-3, 4):
-                self.ranges[(idx + di) % n] = obstacle_dist
+        """Minimal LaserScan substitute for offline testing.
+        Non-overlapping index ranges so one sector never bleeds into another."""
+        def __init__(self, front=2.0, front_right=2.0,
+                     front_left=2.0, right=2.0, left=2.0):
+            self.ranges = [2.0] * 360
+            # FRONT: strictly inside 340–359, 0–20 (avoiding boundary indices)
+            for i in list(range(341, 360)) + list(range(0, 20)):
+                self.ranges[i] = front
+            # FRONT_RIGHT: 301–339
+            for i in range(301, 340):
+                self.ranges[i] = front_right
+            # FRONT_LEFT: 21–59
+            for i in range(21, 60):
+                self.ranges[i] = front_left
+            # RIGHT: 271–299 (avoids 300 boundary with FRONT_RIGHT)
+            for i in range(271, 300):
+                self.ranges[i] = right
+            # LEFT: 61–89
+            for i in range(61, 90):
+                self.ranges[i] = left
 
-    avoider = ObstacleAvoidance()
+    avoider = ObstacleAvoidance(logger=None)
 
-    print('=== Test 1: obstacle dead ahead at 0.20 m (DANGER) ===')
-    avoider.update_scan(FakeScan(obstacle_angle_deg=0, obstacle_dist=0.20))
-    for name, s in avoider.get_sectors().items():
-        if s.n_points > 0:
-            print(f'  {name:15s} min={s.min_dist:.3f}m  {s.alert.name}')
-    print(f'  is_front_danger() → {avoider.is_front_danger()}')
-    cmd, avoid = avoider.compute(0, 0, 0, 5, 5)
-    print(f'  cmd={cmd}  in_avoidance={avoid}')
-    print()
+    # ---- Test 1: FREE state, clear path ----
+    scan = FakeScan(front=2.0, front_right=2.0, front_left=2.0,
+                    right=0.35, left=2.0)
+    avoider.update_scan(scan)
+    cmd, active = avoider.compute(0.0, 0.0, 0.0, 3.0, 0.0)
+    assert not active, 'Should be FREE when path is clear'
+    assert avoider.get_state() == AvoidState.FREE
+    print('Test 1 PASS — clear path → FREE')
 
-    avoider.reset()
+    # ---- Test 2: Obstacle ahead → enter WALL_FOLLOW ----
+    scan_blocked = FakeScan(front=0.30, front_right=0.30, front_left=2.0,
+                            right=0.35, left=2.0)
+    avoider.update_scan(scan_blocked)
+    cmd, active = avoider.compute(0.0, 0.0, 0.0, 3.0, 0.0)
+    assert active, 'Should be WALL_FOLLOW when obstacle ahead'
+    assert avoider.get_state() == AvoidState.WALL_FOLLOW
+    print(f'Test 2 PASS — obstacle → WALL_FOLLOW  cmd={cmd}')
 
-    print('=== Test 2: obstacle 30° left at 0.40 m (WARNING) ===')
-    avoider.update_scan(FakeScan(obstacle_angle_deg=30, obstacle_dist=0.40))
-    for name, s in avoider.get_sectors().items():
-        if s.n_points > 0:
-            print(f'  {name:15s} min={s.min_dist:.3f}m  {s.alert.name}')
-    print(f'  is_front_danger() → {avoider.is_front_danger()}')
-    cmd, avoid = avoider.compute(0, 0, 0, 5, 5)
-    print(f'  cmd={cmd}  in_avoidance={avoid}')
-    print()
+    # ---- Test 3: is_front_danger ----
+    scan_danger = FakeScan(front=0.20)
+    avoider2 = ObstacleAvoidance()
+    avoider2.update_scan(scan_danger)
+    assert avoider2.is_front_danger(), 'DANGER not triggered at 0.20 m'
+    print('Test 3 PASS — is_front_danger at 0.20 m')
 
-    print('=== Test 3: clear scan (all SAFE) ===')
-    avoider.reset()
-    avoider.update_scan(FakeScan(obstacle_angle_deg=180, obstacle_dist=3.0))
-    print(f'  is_front_danger() → {avoider.is_front_danger()}')
-    cmd, avoid = avoider.compute(0, 0, 0, 5, 5)
-    print(f'  cmd={cmd}  in_avoidance={avoid}')
+    scan_safe = FakeScan(front=0.50)
+    avoider2.update_scan(scan_safe)
+    assert not avoider2.is_front_danger(), 'DANGER false positive at 0.50 m'
+    print('Test 4 PASS — no danger at 0.50 m')
+
+    # ---- Test 5: m-line distance calculation ----
+    avoider3 = ObstacleAvoidance()
+    avoider3._hit_x = 0.0
+    avoider3._hit_y = 0.0
+    # m-line goes along X axis (hit 0,0 → goal 5,0)
+    d = avoider3._mline_distance(1.0, 1.0, 5.0, 0.0)
+    assert abs(d - 1.0) < 1e-9, f'Expected 1.0, got {d}'
+    d2 = avoider3._mline_distance(2.0, 0.0, 5.0, 0.0)
+    assert abs(d2 - 0.0) < 1e-9, f'Expected 0.0 on line, got {d2}'
+    print('Test 5 PASS — m-line distance correct')
+
+    print('\nAll tests passed.')

@@ -25,7 +25,7 @@ class Config:
     # Canvia aquests valors segons on poses el robot físicament
     START_X         = 0.0    # m — posició X inicial al mapa
     START_Y         = 0.0    # m — posició Y inicial al mapa
-    START_YAW_DEG   = 90.0    # graus — cap on mira (0° = eix X positiu)
+    START_YAW_DEG   = 0.0    # graus — cap on mira (0° = eix X positiu)
 
     # Distància del waypoint de test (3m endavant de la direcció inicial)
     TEST_DISTANCE   = 3.0    # m
