@@ -46,14 +46,14 @@ class Config:
     """All tuneable parameters in one place — no magic numbers elsewhere."""
 
     # --- Distance thresholds ---
-    DANGER_DIST           = 0.25   # m   — watchdog emergency threshold
-    WARNING_DIST          = 0.45   # m   — obstacle triggers avoidance entry
-    SAFE_DIST             = 0.60   # m   — considered open space
+    DANGER_DIST           = 0.20   # m   — watchdog emergency threshold
+    WARNING_DIST          = 0.30   # m   — obstacle triggers avoidance entry
+    SAFE_DIST             = 0.38   # m   — considered open space
 
     # --- Wall following ---
-    WALL_FOLLOW_DIST      = 0.35   # m   — desired lateral distance to right wall
+    WALL_FOLLOW_DIST      = 0.22   # m   — desired lateral distance to right wall
     WALL_FOLLOW_SPEED     = 0.10   # m/s — forward speed during wall follow
-    KP_WALL               = 0.8    # —   — proportional gain for lateral error
+    KP_WALL               = 1.2    # —   — proportional gain for lateral error
     TURN_SPEED            = 0.50   # rad/s — turn speed when front is blocked
     CORNER_TURN_FACTOR    = 0.6    # —   — factor applied at front-right corner
 
@@ -679,7 +679,7 @@ if __name__ == '__main__':
     print('Test 1 PASS — clear path → FREE')
 
     # ---- Test 2: Obstacle ahead → enter WALL_FOLLOW ----
-    scan_blocked = FakeScan(front=0.30, front_right=0.30, front_left=2.0,
+    scan_blocked = FakeScan(front=0.25, front_right=0.25, front_left=2.0,
                             right=0.35, left=2.0)
     avoider.update_scan(scan_blocked)
     cmd, active = avoider.compute(0.0, 0.0, 0.0, 3.0, 0.0)
@@ -688,11 +688,11 @@ if __name__ == '__main__':
     print(f'Test 2 PASS — obstacle → WALL_FOLLOW  cmd={cmd}')
 
     # ---- Test 3: is_front_danger ----
-    scan_danger = FakeScan(front=0.20)
+    scan_danger = FakeScan(front=0.15)
     avoider2 = ObstacleAvoidance()
     avoider2.update_scan(scan_danger)
-    assert avoider2.is_front_danger(), 'DANGER not triggered at 0.20 m'
-    print('Test 3 PASS — is_front_danger at 0.20 m')
+    assert avoider2.is_front_danger(), 'DANGER not triggered at 0.15 m'
+    print('Test 3 PASS — is_front_danger at 0.15 m')
 
     scan_safe = FakeScan(front=0.50)
     avoider2.update_scan(scan_safe)
