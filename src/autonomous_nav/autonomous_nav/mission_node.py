@@ -502,15 +502,11 @@ class MissionNode(Node):
 
         # During APPROACH we still run obstacle avoidance
         if self._docker.get_state().name == 'APPROACH':
-            _, in_avoidance = self._avoider.compute(
+            avd_cmd, in_avoidance = self._avoider.compute(
                 self._x, self._y, self._yaw,
                 self._station_map_x, self._station_map_y,
             )
             if in_avoidance:
-                avd_cmd, _ = self._avoider.compute(
-                    self._x, self._y, self._yaw,
-                    self._station_map_x, self._station_map_y,
-                )
                 self._publish(avd_cmd.linear_x, avd_cmd.angular_z)
                 return
 
@@ -726,10 +722,7 @@ class MissionNode(Node):
             MissionPhase.MISSION_COMPLETE: 'III',
         }.get(self._phase, 'I')
 
-        n_obs = sum(
-            1 for s in self._avoider.get_sectors().values()
-            if s.alert.name != 'SAFE'
-        )
+        n_obs = 1 if self._avoider.get_state().name != 'FREE' else 0
 
         self._csv_logger.update(
             phase      = phase_str,
