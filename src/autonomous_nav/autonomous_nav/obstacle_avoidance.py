@@ -56,6 +56,7 @@ class Config:
     KP_WALL               = 2.8    # —   — proportional gain for lateral error
     TURN_SPEED            = 0.35   # rad/s — turn speed when front is blocked
     CORNER_TURN_FACTOR    = 0.8    # —   — factor applied at corners
+    LOST_WALL_TURN_SPEED  = 0.80   # rad/s — sharp turn when following wall is lost
 
     # --- Bug2 exit conditions ---
     M_LINE_THRESHOLD      = 0.15   # m   — perpendicular dist to m-line for "on line"
@@ -464,7 +465,8 @@ class ObstacleAvoidance:
 
             # Case 4: Left wall completely absent — lean left to search for wall
             if self._left_min > Config.SAFE_DIST * 1.5:
-                angular_z = _clamp(Config.TURN_SPEED * 0.4, -Config.ANGULAR_MAX, Config.ANGULAR_MAX)
+                angular_z = _clamp(Config.LOST_WALL_TURN_SPEED, -Config.ANGULAR_MAX, Config.ANGULAR_MAX)
+                return VelocityCommand(Config.WALL_FOLLOW_SPEED * 0.6, angular_z)
 
             return VelocityCommand(
                 _clamp(Config.WALL_FOLLOW_SPEED, 0.0, Config.LINEAR_MAX),
@@ -502,10 +504,8 @@ class ObstacleAvoidance:
 
         # Case 4: Right wall completely absent — lean right to search for wall
         if self._right_min > Config.SAFE_DIST * 1.5:
-            angular_z = _clamp(
-                -Config.TURN_SPEED * 0.4,
-                -Config.ANGULAR_MAX, Config.ANGULAR_MAX,
-            )
+            angular_z = _clamp(-Config.LOST_WALL_TURN_SPEED, -Config.ANGULAR_MAX, Config.ANGULAR_MAX)
+            return VelocityCommand(Config.WALL_FOLLOW_SPEED * 0.6, angular_z)
 
         return VelocityCommand(
             _clamp(Config.WALL_FOLLOW_SPEED, 0.0, Config.LINEAR_MAX),
