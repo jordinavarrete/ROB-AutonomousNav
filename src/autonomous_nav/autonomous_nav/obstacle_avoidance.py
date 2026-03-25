@@ -46,21 +46,21 @@ class Config:
     """All tuneable parameters in one place — no magic numbers elsewhere."""
 
     # --- Distance thresholds ---
-    DANGER_DIST           = 0.20   # m   — watchdog emergency threshold
-    WARNING_DIST          = 0.30   # m   — obstacle triggers avoidance entry
-    SAFE_DIST             = 0.38   # m   — considered open space
+    DANGER_DIST           = 0.14   # m   — watchdog emergency threshold
+    WARNING_DIST          = 0.25   # m   — obstacle triggers avoidance entry
+    SAFE_DIST             = 0.32   # m   — considered open space
 
     # --- Wall following ---
-    WALL_FOLLOW_DIST      = 0.22   # m   — desired lateral distance to right wall
-    WALL_FOLLOW_SPEED     = 0.10   # m/s — forward speed during wall follow
-    KP_WALL               = 1.2    # —   — proportional gain for lateral error
-    TURN_SPEED            = 0.50   # rad/s — turn speed when front is blocked
-    CORNER_TURN_FACTOR    = 0.6    # —   — factor applied at front-right corner
+    WALL_FOLLOW_DIST      = 0.16   # m   — desired lateral distance from wall
+    WALL_FOLLOW_SPEED     = 0.05   # m/s — forward speed during wall follow
+    KP_WALL               = 2.8    # —   — proportional gain for lateral error
+    TURN_SPEED            = 0.35   # rad/s — turn speed when front is blocked
+    CORNER_TURN_FACTOR    = 0.8    # —   — factor applied at corners
 
     # --- Bug2 exit conditions ---
-    M_LINE_THRESHOLD      = 0.20   # m   — perpendicular dist to m-line for "on line"
-    DISTANCE_PROGRESS_MIN = 0.20   # m   — min extra progress toward goal to exit
-    MIN_TRAVEL_FROM_HIT   = 0.30   # m   — min distance from hit point before checking exit
+    M_LINE_THRESHOLD      = 0.15   # m   — perpendicular dist to m-line for "on line"
+    DISTANCE_PROGRESS_MIN = 0.15   # m   — min extra progress toward goal to exit
+    MIN_TRAVEL_FROM_HIT   = 0.20   # m   — min distance from hit point before checking exit
 
     # --- Anti-stuck ---
     STUCK_CHECK_TICKS     = 40     # ticks (2 s @ 20 Hz) between stuck evaluations
@@ -189,6 +189,7 @@ class ObstacleAvoidance:
 
         # ---- Exit cooldown (avoids instant re-entry after leaving WALL_FOLLOW) ----
         self._exit_cooldown: int = 0
+        self._wall_side: str = 'RIGHT'
 
     # ==========================================================
     # PUBLIC API
@@ -326,6 +327,7 @@ class ObstacleAvoidance:
         self._rotation_accum    = 0.0
         self._rotation_ticks    = 0
         self._hit_dist_to_goal  = float('inf')
+        self._wall_side         = 'RIGHT'
         self._log_info('[AVOID] State reset → FREE')
 
     # ==========================================================
@@ -374,8 +376,17 @@ class ObstacleAvoidance:
         self._rotation_ticks   = 0
         self._force_turn_ticks = 0
 
+        # Compare free space on both sides (including diagonals)
+        space_right = min(self._front_right_min, self._right_min)
+        space_left  = min(self._front_left_min, self._left_min)
+
+        if space_right > space_left:
+            self._wall_side = 'LEFT'   # Right is more open -> turn Right -> Wall on Left
+        else:
+            self._wall_side = 'RIGHT'  # Left is more open -> turn Left -> Wall on Right
+
         self._log_info(
-            f'[AVOID] FREE → WALL_FOLLOW  '
+            f'[AVOID] FREE → WALL_FOLLOW ({self._wall_side} SIDE)  '
             f'hit=({x:.2f}, {y:.2f})  '
             f'dist_to_goal={dist_to_goal:.2f} m  '
             f'front_min={self._front_min:.2f} m'
@@ -405,9 +416,10 @@ class ObstacleAvoidance:
         # ---- Anti-stuck forced rotation override ----
         if self._force_turn_ticks > 0:
             self._force_turn_ticks -= 1
+            turn_vel = Config.TURN_SPEED if self._wall_side == 'RIGHT' else -Config.TURN_SPEED
             cmd = VelocityCommand(
                 0.0,
-                _clamp(Config.TURN_SPEED, -Config.ANGULAR_MAX, Config.ANGULAR_MAX),
+                _clamp(turn_vel, -Config.ANGULAR_MAX, Config.ANGULAR_MAX),
             )
             return cmd, True
 
@@ -429,19 +441,37 @@ class ObstacleAvoidance:
 
     def _wall_follow_cmd(self) -> VelocityCommand:
         """
-        Proportional wall-following velocity command (wall on RIGHT side).
-
-        Priority (highest first):
-          1. FRONT < WARNING_DIST  → stop + turn left in place.
-          2. FRONT_RIGHT < WARNING_DIST  → corner ahead; slow + bear left.
-          3. Normal follow  → proportional lateral distance control:
-               - too far from wall  → turn right (negative angular_z)
-               - too close to wall  → turn left  (positive angular_z)
-          4. No wall found on right (open space)  → lean right to find wall.
-
-        Returns:
-            VelocityCommand clamped to hard speed limits.
+        Proportional wall-following velocity command (dynamic side).
         """
+        if self._wall_side == 'LEFT':
+            # Case 1: Front blocked — turn right in-place
+            if self._front_min < Config.WARNING_DIST:
+                return VelocityCommand(
+                    0.0,
+                    _clamp(-Config.TURN_SPEED, -Config.ANGULAR_MAX, Config.ANGULAR_MAX),
+                )
+
+            # Case 2: Front-left corner approaching — reduce speed, bear right
+            if self._front_left_min < Config.WARNING_DIST:
+                return VelocityCommand(
+                    _clamp(Config.WALL_FOLLOW_SPEED * 0.5, 0.0, Config.LINEAR_MAX),
+                    _clamp(-Config.TURN_SPEED * Config.CORNER_TURN_FACTOR, -Config.ANGULAR_MAX, Config.ANGULAR_MAX),
+                )
+
+            # Case 3: Normal proportional wall-follow
+            lateral_error = Config.WALL_FOLLOW_DIST - self._left_min
+            angular_z = _clamp(-Config.KP_WALL * lateral_error, -Config.ANGULAR_MAX, Config.ANGULAR_MAX)
+
+            # Case 4: Left wall completely absent — lean left to search for wall
+            if self._left_min > Config.SAFE_DIST * 1.5:
+                angular_z = _clamp(Config.TURN_SPEED * 0.4, -Config.ANGULAR_MAX, Config.ANGULAR_MAX)
+
+            return VelocityCommand(
+                _clamp(Config.WALL_FOLLOW_SPEED, 0.0, Config.LINEAR_MAX),
+                angular_z,
+            )
+
+        # RIGHT SIDE
         # Case 1: Front blocked — turn left in-place
         if self._front_min < Config.WARNING_DIST:
             return VelocityCommand(
@@ -463,8 +493,6 @@ class ObstacleAvoidance:
             )
 
         # Case 3: Normal proportional wall-follow
-        #   lateral_error > 0  → too close  → turn left  (+angular_z)
-        #   lateral_error < 0  → too far    → turn right (−angular_z)
         lateral_error = Config.WALL_FOLLOW_DIST - self._right_min
         angular_z     = _clamp(
             Config.KP_WALL * lateral_error,
@@ -679,7 +707,7 @@ if __name__ == '__main__':
     print('Test 1 PASS — clear path → FREE')
 
     # ---- Test 2: Obstacle ahead → enter WALL_FOLLOW ----
-    scan_blocked = FakeScan(front=0.25, front_right=0.25, front_left=2.0,
+    scan_blocked = FakeScan(front=0.20, front_right=0.20, front_left=2.0,
                             right=0.35, left=2.0)
     avoider.update_scan(scan_blocked)
     cmd, active = avoider.compute(0.0, 0.0, 0.0, 3.0, 0.0)
@@ -688,11 +716,11 @@ if __name__ == '__main__':
     print(f'Test 2 PASS — obstacle → WALL_FOLLOW  cmd={cmd}')
 
     # ---- Test 3: is_front_danger ----
-    scan_danger = FakeScan(front=0.15)
+    scan_danger = FakeScan(front=0.10)
     avoider2 = ObstacleAvoidance()
     avoider2.update_scan(scan_danger)
-    assert avoider2.is_front_danger(), 'DANGER not triggered at 0.15 m'
-    print('Test 3 PASS — is_front_danger at 0.15 m')
+    assert avoider2.is_front_danger(), 'DANGER not triggered at 0.10 m'
+    print('Test 3 PASS — is_front_danger at 0.10 m')
 
     scan_safe = FakeScan(front=0.50)
     avoider2.update_scan(scan_safe)
