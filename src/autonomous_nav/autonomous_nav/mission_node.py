@@ -63,6 +63,12 @@ class Config:
         (5.00, 11.69),   # Punt Base
     ]
 
+    # Initial robot pose in map frame (metres / radians).
+    # Overridden at runtime by ROS2 parameters initial_x, initial_y, initial_yaw.
+    INITIAL_X   = 3.32   # m
+    INITIAL_Y   = 0.95  # m
+    INITIAL_YAW = 0.0   # rad  (0 = facing +X axis)
+
     # Logger interval
     LOG_CSV_INTERVAL_S  = 1.0
 
@@ -133,6 +139,13 @@ class MissionNode(Node):
         super().__init__('mission_node')
 
         # ----------------------------------------------------------
+        # Initial pose — edit Config.INITIAL_X/Y/YAW at the top of the file
+        # ----------------------------------------------------------
+        self._init_x   = Config.INITIAL_X
+        self._init_y   = Config.INITIAL_Y
+        self._init_yaw = Config.INITIAL_YAW
+
+        # ----------------------------------------------------------
         # QoS profiles
         # ----------------------------------------------------------
         qos_reliable    = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,    depth=10)
@@ -159,12 +172,14 @@ class MissionNode(Node):
         self._slam_valid  = False
 
         # ----------------------------------------------------------
-        # Robot pose (updated by odom + TF callbacks)
+        # Robot pose (updated by odom + TF callbacks).
+        # Seeded with the initial pose so waypoint distances are correct
+        # from the very first control tick — before any odom arrives.
         # ----------------------------------------------------------
-        self._x   = 0.0
-        self._y   = 0.0
-        self._yaw = 0.0
-        self._prev_yaw = 0.0    # for anti-stuck delta_yaw accumulation
+        self._x   = self._init_x
+        self._y   = self._init_y
+        self._yaw = self._init_yaw
+        self._prev_yaw = self._init_yaw   # for anti-stuck delta_yaw accumulation
 
         # ----------------------------------------------------------
         # Sub-modules
@@ -210,6 +225,9 @@ class MissionNode(Node):
             '\n'
             '================================================\n'
             '  AUTONOMOUS NAVIGATION - Mission Node          \n'
+            f'  Posa inicial: x={self._init_x:.3f}  '
+            f'y={self._init_y:.3f}  '
+            f'yaw={math.degrees(self._init_yaw):.1f}°\n'
             '  Esperant /scan i /odom...                     \n'
             '================================================'
         )
@@ -233,24 +251,39 @@ class MissionNode(Node):
         """
         Update robot pose from odometry.
 
-        Also attempts to read the SLAM-corrected pose from TF.
-        Falls back silently to odometry if TF is not yet available.
+        When SLAM is not yet available the raw odometry (which always starts
+        at the origin) is transformed into the map frame using the user-
+        supplied initial pose (initial_x, initial_y, initial_yaw):
+
+            map_x   = init_x + odom_x * cos(init_yaw) - odom_y * sin(init_yaw)
+            map_y   = init_y + odom_x * sin(init_yaw) + odom_y * cos(init_yaw)
+            map_yaw = normalise(init_yaw + odom_yaw)
+
+        Once SLAM publishes a valid TF the SLAM-corrected pose takes over and
+        the odometry offset is no longer applied.
         """
-        # Odometry pose (always available)
+        # Raw odometry (robot starts at odom origin = 0,0,0)
         odom_x   = msg.pose.pose.position.x
         odom_y   = msg.pose.pose.position.y
         odom_yaw = self._quat_to_yaw(msg.pose.pose.orientation)
 
-        self._navigator.set_odom_pose(odom_x, odom_y, odom_yaw)
+        # Transform odom → map frame using initial pose
+        cos_i = math.cos(self._init_yaw)
+        sin_i = math.sin(self._init_yaw)
+        map_x   = self._init_x + odom_x * cos_i - odom_y * sin_i
+        map_y   = self._init_y + odom_x * sin_i + odom_y * cos_i
+        map_yaw = normalize_angle(self._init_yaw + odom_yaw)
 
-        # Attempt SLAM pose via TF
+        self._navigator.set_odom_pose(map_x, map_y, map_yaw)
+
+        # Attempt SLAM pose via TF (takes over once SLAM is initialised)
         slam_x, slam_y, slam_yaw = self._try_slam_pose()
         if slam_x is not None:
             self._navigator.set_slam_pose(slam_x, slam_y, slam_yaw)
             self._x, self._y, self._yaw = slam_x, slam_y, slam_yaw
             self._slam_valid = True
         else:
-            self._x, self._y, self._yaw = odom_x, odom_y, odom_yaw
+            self._x, self._y, self._yaw = map_x, map_y, map_yaw
 
     # ==========================================================
     # WATCHDOG (50 Hz)
