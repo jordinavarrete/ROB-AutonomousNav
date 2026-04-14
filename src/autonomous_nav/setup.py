@@ -31,6 +31,7 @@ setup(
             'mission_node = autonomous_nav.mission_node:main',
             'debug_nav_node = autonomous_nav.debug_nav_node:main',
             'debug_station_node = autonomous_nav.debug_station_node:main',
+            'debug_docking_node = autonomous_nav.debug_docking_node:main',
         ],
     },
 )

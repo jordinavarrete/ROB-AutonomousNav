@@ -1,0 +1,479 @@
+ROBÒTICA
+ Resum Complet — Parcial 1
+ Departament ESAII · UPC
+Aquest document conté el resum esquemàtic complet de tot el temari del 1r parcial de
+Robòtica, organitzat en 6 blocs. Els conceptes marcats amb (Formulari) apareixen al formulari
+oficial de l'examen i exigeixen càlcul numèric.
+PART 1 — Introducció · Eines bàsiques ·
+ Cinemàtica · Navegació
+Bloc 1 · Introducció a la robòtica
+Definicions de robot
+ISO 8373 (la més formal i tècnica): manipulador multifuncional programable, controlat
+automàticament en 3 o més eixos, sobre base fixa o mòbil, per a automatització industrial.
+McKerrow (1986) (la funcional): màquina programable per fer una varietat de tasques, igual
+que un ordinador és un circuit programable.
+Definició del curs (la més usada): màquina orientada a objectius que pot sentir, planificar i
+actuar (Sense → Plan → Act). Un robot integra sempre tres parts: estructura mecànica,
+electrònica i computació.
+Lleis d'Asimov (1942)
+Rellevants com a marc ètic:
+• Llei 0: un robot no pot perjudicar la humanitat, ni per inacció.
+• Llei 1: un robot no pot perjudicar un humà, ni per inacció.
+• Llei 2: un robot ha d'obeir ordres humans, excepte si contradiuen la Llei 1.
+• Llei 3: un robot ha de protegir la seva existència, excepte si contradiu les anteriors.
+Fites rellevants
+ Any
+ Fita
+1954–61
+Unimate — primer braç industrial (Unimation / GM)
+1966–72
+Shakey — primer robot mòbil intel·ligent (SRI)
+1966
+CURV — primer vehicle submarí (US Navy)
+1970
+Lunokhod 1 — primer robot a la lluna (URSS)
+1996
+ASIMO — robot humanoide (Honda)
+1997
+Mars Pathfinder — rover a Mart (NASA)
+2000
+Da Vinci Surgical System (Intuitive Surgical)
+2002
+Roomba — primer robot domèstic comercial (iRobot)
+Aplicacions (8 sectors)
+Indústria · Enginyeria civil · Serveis · Medicina · Agricultura · Exploració · Entorns hostils ·
+Educació i entreteniment.
+Impacte social
+Destrucció/creació de llocs de treball, seguretat en entorns perillosos, millora de la salut
+(cirurgia, rehabilitació), debat ètic sobre autonomia i decisions, ciberseguretat
+d'infraestructures crítiques.
+Bloc 2 · Eines bàsiques: Pose, rotació i transformació
+Conceptes de posició, orientació i pose
+• Posició: coordenades (x, y) en 2D o (x, y, z) en 3D respecte un sistema de referència.
+• Orientació: la rotació d'un objecte respecte un sistema de referència.
+• Pose = posició + orientació. En 2D: (x, y, θ). En 3D: (x, y, z) + representació de rotació.
+• Grau de llibertat (DOF): paràmetres independents per descriure la pose. En 2D: 3 DOF
+(x, y, θ). En 3D: 6 DOF (3 traslació + 3 rotació).
+Sistemes de referència i composició de poses
+Un sistema de referència {A} és definit pels seus vectors base. La pose relativa ^A ξ_B descriu
+on és el frame {B} respecte {A}. Les poses es poden compondre:
+(Formula
+ri)
+⁰ξ₂ = ⁰ξ₁ ⊕ ¹ξ₂ i ᴬp = ᴬξ_B · ᴮp
+Important: la composició de moviments NO és commutativa: ξ₁ ⊕ ξ₂ ≠ ξ₂ ⊕ ξ₁.
+Matrius de rotació 3D (Formulari)
+Tres matrius de rotació bàsiques al voltant de cada eix un angle θ:
+(Formula
+ri)
+Rx = [[1, 0, 0], [0, cosθ, −sinθ], [0, sinθ, cosθ]]
+Ry = [[cosθ, 0, sinθ], [0, 1, 0], [−sinθ, 0, cosθ]]
+Rz = [[cosθ, −sinθ, 0], [sinθ, cosθ, 0], [0, 0, 1]]
+Propietats clau (matrius ortogonals): R⁻¹ = Rᵀ i det(R) = 1. Les columnes són vectors
+ortonormals.
+Matriu de transformació homogènia 4×4 (Formulari)
+Per representar simultàniament rotació i translació en 3D:
+(Formula
+ri)
+ᴬT_B = [ ᴬR_B t ]
+[ 0₁ₓ₃ 1 ]
+Transformació de punt: p̃ᴬ = ᴬT_B · p̃ᴮ
+Composició (⊕):
+(Formula
+ri)
+T₁ ⊕ T₂ → T₁T₂ = [ R₁R₂ t₁ + R₁t₂ ]
+[ 0 1 ]
+Inversió (⊖):
+(Formula
+ri)
+T⁻¹ = [ Rᵀ −Rᵀt ]
+[ 0 1 ]
+Atenció: la translació s'ha de rotar (−Rᵀt, no simplement −t).
+Representació de l'orientació en 3D
+Les matrius 3×3 tenen 9 elements però només 3 DOF. Alternatives:
+• Angles d'Euler: seqüència de màxim 3 rotacions consecutives. 12 seqüències possibles
+(ZYZ, ZYX, XYZ...). Problema: {B('Gimbal Lock')} — quan dos eixos s'alineen es perd 1 DOF.
+• Quaternions: extensió dels nombres complexos, q̄ = s + vₓi + v_yj + v_zk. El quaternió
+unitari |q̄| = 1 representa rotació pura. Avantatges: no té Gimbal Lock, interpolació suau,
+càlcul eficient.
+Bloc 3 · Cinemàtica de robots mòbils
+Mecanismes de locomoció
+Tipus
+ Superfície
+ Velocitat
+ Ús típic
+Rodes
+Llisa, sense obstacles
+Alta (0–30 m/s)
+Neteja, distribució
+Erugues
+Irregular sense discontinuïtats
+Mitjana
+Exploració, manteniment
+Potes
+Irregular amb discontinuïtats
+Baixa (0–2 m/s)
+Terreny difícil
+Voladors
+Qualsevol
+Alta (0–50 m/s)
+Reconeixement
+Submarins
+Subaquàtic
+Baixa
+Exploració submarina
+Cable
+Superfícies verticals
+Baixa
+Manteniment edificis
+Tipus de rodes
+• Convencional: gira al voltant del seu eix. 1 DOF. La perpendicular a la seva velocitat
+passa per l'ICR.
+• Directriu: com la convencional però amb eix vertical per canviar la direcció. 2 DOF.
+• Omnidireccional (Swedish/Mecanum): petits rodets al perímetre. Moviment lateral
+sense girar.
+Relació cinemàtica lineal-angular de la roda (Formulari)
+Per a una roda convencional, velocitats del centre en funció de la roda:
+(Formula
+ri)
+[vₓ] [ 0 ]
+[v_y] = [ r·ωₓ ] on r = radi roda, ωₓ = vel. angular roda
+[ωz] [ ψ̇ ]
+El component vₓ = 0 indica la restricció de no lliscament lateral.
+ICR — Centre Instantani de Rotació
+En qualsevol instant el moviment d'un robot es pot modelar com una rotació pura al voltant de
+l'ICR. Es troba a la intersecció de les perpendiculars als vectors de velocitat de totes les
+rodes. Si no convergeixen en un únic punt:
+• Fricció paràsita (tire scrub): les rodes llisquen i es desgasten.
+• Ineficiència energètica: es malbarata energia lluitant contra el terra.
+Casos especials: ICR a l'infinit → línia recta. ICR al centre → rotació in situ.
+Robot diferencial (Formulari)
+Dues rodes coaxials amb velocitats angulars independents ωr i ωl. S = semidistància entre
+rodes.
+Cinemàtica directa (donades les rodes, calcular vC i ψ̇):
+(Formula
+ri)
+vL = r·ωl vR = r·ωr
+vC = (vR + vL) / 2
+ψ̇ = (vR − vL) / (2S)
+R = S · (vR + vL) / (vR − vL) [radi de curvatura]
+Forma matricial — cinemàtica directa (Jacobiana):
+(Formula
+ri)
+[ vFy ] r [ S S ] [ ω_x1 ]
+[ Ψ̇ ] = ——— · [ 1 −1 ] [ ω_x2 ]
+2S
+Cinemàtica inversa (donat el moviment desitjat, calcular les rodes):
+(Formula
+ri)
+[ ω_x1 ] 1 [ 1 S ] [ vFy ]
+[ ω_x2 ] = — · [ 1 −S ] [ Ψ̇ ]
+r
+Casos particulars del robot diferencial:
+ Condició
+ Resultat
+vR = vL
+R = ∞ → moviment en línia recta
+vL = −vR
+R = 0 → rotació in situ
+vR = 0, vL ≠ 0
+R = −S → gira sobre roda dreta
+vL = 0, vR ≠ 0
+R = S → gira sobre roda esquerra
+vR > vL
+ICR a l'esquerra del robot
+vL > vR
+ICR a la dreta del robot
+Robot bicicleta / tricicle (Formulari)
+Vehicle amb roda directriu davantera (angle γ) i roda motriu posterior. L = distància entre eixos
+(wheelbase).
+Cinemàtica directa:
+(Formula
+ri)
+ẋ = v·cosθ
+ẏ = v·sinθ
+θ̇ = (v/L)·tanγ
+Vincle no-holonòmic: el vehicle no es pot moure lateralment. v_y^B = ẏ·cosθ − ẋ·sinθ ≡ 0.
+Menys DOF de moviment que de configuració.
+Cinemàtica inversa:
+(Formula
+ri)
+γ = arctan(θ̇·L / v) w = v / r
+Bloc 4 · Navegació i planificació de rutes
+Estructura del sistema de control
+Un robot autònom ha de respondre: on sóc? on vaig? com hi arribo? Tres primitives robòtiques:
+ Primitiva
+ Entrada
+ Sortida
+SENSE
+Dades del sensor
+Informació de l'entorn
+PLAN
+Informació sensada i/o cognitiva
+Directives
+ACT
+Informació sensada o directives
+Ordres als actuadors
+Arquitectures de navegació
+• Jeràrquica: SENSE → PLAN → ACT en seqüència estricta. Lenta però òptima. Necessita
+model complet.
+• Reactiva: SENSE → ACT directament. Ràpida però sense memòria ni mapa.
+• Basada en comportaments: diverses capes SENSE-ACT paral·leles per a comportaments
+independents.
+• Híbrida: planificador d'alt nivell + comportaments reactius de baix nivell.
+Navegació reactiva — Vehicles de Braitenberg
+Connexió directa sensor-motor, sense representació interna ni memòria. El robot cerca el
+màxim d'un camp escalar (llum, química). Molt simples però la complexitat creix ràpidament en
+afegir comportaments.
+Navegació reactiva — Algoritme BUG2
+Robot sense mapa. Avança en línia recta cap al goal. En trobar un obstacle, rodeja el contorn
+fins trobar un punt de la línia M-line més proper al goal que el punt de contacte. No garanteix
+camí òptim però sí arribar.
+Algoritmes de cerca en grafs
+• BFS: explora per nivells. Camí amb menys salts, no el de menor cost si hi ha pesos.
+• UCS: expandeix el node de menor cost acumulat. Òptim amb costos positius.
+• Dijkstra: versió eficient d'UCS amb cua de prioritat. Camí òptim a tots els nodes.
+• A*: com Dijkstra + heurística h(n) que estima el cost restant. f(n) = g(n) + h(n). Si h(n) és
+admissible (no sobreestima), A* és òptim i complet. Molt més eficient que Dijkstra.
+Occupancy Grid — Distance Transform
+Converteix una occupancy grid en una matriu on el valor de cada cel·la és la seva distància al
+goal. El robot segueix el gradient decreixent. Simple i eficient però el camí depèn del goal (s'ha
+de recalcular si canvia).
+D* (Dynamic A*)
+Extensió de A* per a replanning dinàmic. Genera un mapa de costos (c = ∞ per obstacles). Crea
+un graf dens amb link al veí més proper al goal. Característica clau: actualitza el pla
+eficientment quan el robot descobreix nous obstacles. Molt útil en entorns parcialment
+desconeguts.
+Roadmaps (planificació en dues fases)
+Separen la planificació en fase de planificació (anàlisi del mapa, es fa una vegada) i fase de
+query (start + goal, molt ràpida):
+• Voronoi: camins equidistants als obstacles. Thinning de l'espai lliure. Camins segurs però
+no necessàriament curts.
+• PRM: N punts aleatoris en espai lliure, connectats per línies sense obstacles. Molt eficient
+computacionalment. Camí no òptim. Útil en espais d'alta dimensió.
+Comparació dels mètodes de navegació
+ Mètode
+ Mapa
+ Òptim
+ Dinàmic
+ Ús típic
+Braitenberg
+No
+No
+Sí
+Comportaments simples
+BUG2
+No
+No
+Sí
+Entorns desconeguts
+BFS/Dijkstra/A*
+Graf
+Sí
+No
+Entorns estructurats
+Distance Transform
+Grid
+Sí
+No
+Entorns tancats
+D*
+Grid
+Sí
+Sí
+Entorns semi-desc.
+Voronoi
+Grid
+Segur
+No
+Navegació conservadora
+PRM
+Grid
+No
+No
+Alta dimensió
+PART 2 — Localització · SLAM · Sensors · ROS2
+Bloc 5 · Localització i odometria
+Concepte de localització
+Procés d'estimar la pose del robot (x, y, θ) dins un entorn. Tres nivells:
+• Local (tracking): la pose inicial és coneguda, cal actualitzar-la.
+• Global: la pose inicial és desconeguda, cal estimar-la des de zero.
+• Robot segrestat: el robot és mogut sense avís i ha de redetectar-se.
+Odometria
+Mesura del moviment a partir de la rotació de les rodes usant encoders. Proporciona δd
+(distància recorreguda) i δθ (canvi d'orientació).
+• Errors sistemàtics: radi de la roda incorrecte, desalineació. Constants i acumulats.
+• Errors aleatoris: lliscament de les rodes, superfícies irregulars. Impredictibles.
+La IMU (acceleròmetres + giroscopis) complementa l'odometria per mesurar δθ de forma
+independent, però té deriva (gyro bias).
+Bloc 6 · Dead Reckoning (Localització per estima)
+Principi
+Estimació de la pose actual sumant incrementalment el moviment mesurat per odometria a
+partir d'una pose prèvia coneguda. Sense informació externa, l'error creix sense límit.
+Equació del model discret (Formulari)
+Per a un robot diferencial, la nova pose en el pas k+1:
+(Formula
+ri)
+ξ k+1  ≈ [x k ] + [Δs·cos(θ)]
+[y k ] [Δs·sin(θ)]
+[θ k ] [ Δθ ]
+on: Δs = (Δsr + Δsl) / 2 [distància recorreguda]
+Δθ = (Δsr − Δsl) / (2S) [canvi d'orientació]
+Δsr, Δsl = distàncies roda dreta i esquerra en l'interval k
+S = semidistància entre rodes
+Model amb soroll d'odometria
+S'afegeixen variables aleatòries νd i νθ al moviment mesurat. El soroll es modela com un procés
+gaussià de mitjana zero:
+(Formula
+ri)
+ξ k+1  ≈ [x k  + (δd + νd)·cosθ k ]
+[y k  + (δd + νd)·sinθ k ]
+[θ k  + δθ + νθ ]
+V = [[σd², 0 ], (matriu diagonal → errors independents)
+[ 0, σθ²]]
+L'incertesa creix a cada pas (el·lipses d'error s'eixamplen). L'eina matemàtica per estimar la
+pose òptima és el Filtre de Kalman Estès (EKF), que té dues fases:
+• Predicció: a partir de la pose anterior i l'odometria, prediu la nova pose i covariança.
+P̂⁺ k+1  = Fx·P̂ k ·FxT + Fv·V̂·FvT
+• Actualització: quan s'observa un landmark, es corregeix l'estimació. La incertesa es
+redueix bruscament.
+Bloc 7 · Localització per landmarks
+Principi
+Per evitar que l'error creixi sense límit s'introdueix informació externa: observació de punts de
+referència coneguts (landmarks) usant LIDAR, ultrasons o visió. Cada observació permet
+corregir la pose estimada via el cicle predicció-actualització del EKF.
+Lectura LIDAR d'un landmark (Formulari)
+Donat que el robot és a la pose (xv, yv, θv) i el landmark i és a (xi, yi), la lectura del sensor és:
+(Formula
+ri)
+z = (r) = ( sqrt[(yi−yv)² + (xi−xv)²] ) + (wr )
+(β) ( arctan[(yi−yv)/(xi−xv)] − θv ) (wβ )
+r = distància al landmark
+β = angle de mesura (bearing) relatiu a l'orientació del robot
+wr, wβ = soroll del sensor
+Posició estimada del landmark (Formulari)
+A la inversa: si el robot coneix la seva pose i ha llegit (r, β), la posició del landmark és:
+(Formula
+ri)
+(xi) = (xv + r·cos(θv + β))
+(yi) (yv + r·sin(θv + β))
+Quan el robot incorpora l'observació al filtre EKF, el seu el·lipse d'incertesa es redueix
+notablement. El camí estimat fa un 'salt' visible cap a la posició corregida.
+Bloc 8 · Creació de mapes de landmarks
+Si la pose del robot és coneguda perfectament però el mapa és desconegut, cal estimar les
+posicions dels M landmarks. L'estat a estimar és:
+(Formula
+ri)
+x = (x₀, y₀, x₁, y₁, x₂, y₂, ..., x_{M-1}, y_{M-1})ᵀ
+S'usa l'EKF: la predicció és trivial (landmarks estàtics). Les actualitzacions vénen de noves
+observacions.
+Bloc 9 · SLAM — Simultaneous Localization and Mapping
+El problema i la paradoxa
+SLAM resol el problema de construir un mapa i localitzar-se en ell simultàniament. La
+paradoxa ou/gallina: per localitzar-se cal un mapa, per construir el mapa cal bona
+localització. El vector d'estat a optimitzar és:
+(Formula
+ri)
+x = (xv, yv, θv, x₀, y₀, x₁, y₁, ..., x_{M-1}, y_{M-1})ᵀ
+[pose robot] [posicions de M landmarks ]
+Mètode 1 — EKF-SLAM
+Aplica l'EKF a l'estat complet. Avantatge: matemàticament fonamentat, proporciona
+covariança completa. Inconvenients: la matriu de covariança creix com O(M²), inviable en
+entorns grans. Suposa soroll gaussià.
+Mètode 2 — Pose Graph SLAM (PGO)
+Representa la trajectòria com un graf de poses:
+• Vèrtexs: poses del robot i posicions de landmarks.
+• Arestes d'odometria: entre poses consecutives, derivades de δd i δθ.
+• Arestes de landmark: entre una pose i un landmark, derivades del LIDAR.
+Loop closure: quan el robot retorna a una zona visitada i reconeix un landmark previ, es forma
+un bucle en el graf. Permet corregir l'error acumulat en tota la trajectòria.
+Es planteja un problema de mínims quadrats no lineals que distribueix l'error de forma òptima
+per tot el graf. Avantatge clau respecte EKF: la correcció afecta tota la trajectòria, no sols
+l'última predicció.
+Mètode 3 — Particle Filter (FastSLAM / Monte Carlo)
+Representa la distribució de probabilitat de la pose amb N partícules (hipòtesis). Cicle: predicció
+(moure partícules) → ponderació (avaluar amb sensor) → remostreig (replicar millors).
+Avantatges: no suposa soroll gaussià, pot representar distribucions multimodals.
+Inconvenients: cost proporcional a N, problemes en alta dimensió.
+Comparació dels mètodes SLAM
+ Mètode
+ Soroll
+ Escala
+ Loop closure
+ Cost computacional
+EKF-SLAM
+Gaussià
+Petit
+Implícit
+O(M²) — creix molt
+PGO
+Qualsevol
+Gran
+Explícit, global
+Moderat, optimitzable
+Particle Filter
+Qualsevol
+Mitjà
+Implícit
+Proporcional a N
+Bloc 10 · Sensors
+Classificació: propioceptius vs exteroceptius
+• Propioceptius: mesuren l'estat intern del robot. No depenen de l'entorn. Exemples:
+encoders, IMU.
+• Exteroceptius: mesuren l'entorn extern al robot. Depenen del medi. Exemples: LIDAR,
+ultrasons, càmera.
+Encoder (codificador) — Propioceptiu
+Mesura la rotació angular d'un eix. Un disc amb ranures interromp un feix de llum IR, generant
+polsos que permeten calcular l'angle girat i, amb el radi, la distància recorreguda. Tipus:
+incremental (compta polsos) i absolut (posició absoluta). En robòtica s'usen incrementals en
+quadratura (2 canals, 90° desfasats, per detectar sentit). Ús: odometria, control de velocitat.
+IMU — Inertial Measurement Unit — Propioceptiu
+Combina acceleròmetres (acceleració lineal 3 eixos) i giroscopis (velocitat angular 3 eixos).
+Giroscopis MEMS: element vibrant detecta la força de Coriolis quan gira. Ús: estimar orientació i
+velocitat angular independent de les rodes. Limitació: deriva (drift) — errors s'integren en el
+temps.
+LiDAR — Light Detection and Ranging — Exteroceptiu
+Emet polsos làser i mesura el temps de retorn (time of flight): d = c·Δt/2. Un LiDAR 2D fa un
+escombrat rotatori (fins 360°) produint un núvol de punts 2D. LiDAR 3D afegeix múltiples plans.
+Molt precís (cm), independent de la il·luminació. Inconvenients: cost elevat, no detecta objectes
+transparents ni negres mate.
+Sensor d'ultrasons — Exteroceptiu
+Emet un puls d'ultrasó i mesura el temps de retorn de l'eco: d = vso·Δt/2 (vso ≈ 343 m/s).
+Abast: 10 cm – 4 m. Baix cost. Limitacions: angle de con ample (poca resolució angular), no
+detecta superfícies inclinades, sensible a temperatura i vent, no útil per a SLAM precís.
+Bloc 11 · Eines de laboratori: ROS2 i algoritmes
+ROS2 — Robot Operating System 2
+Framework de programari per a robòtica. Capa de comunicació entre processos (nodes), eines
+de visualització, simulació i depuració. No és un SO real, és un middleware.
+• Node: procés independent que realitza una funció específica.
+• Topic: canal de comunicació asíncrona. Un node publica (publish) i un altre se subscriu
+(subscribe).
+• Service: comunicació síncrona petició-resposta.
+• Action: com service però per a tasques llargues amb feedback continu.
+• TF2: gestió de transformacions entre sistemes de referència en temps real.
+Gazebo
+Simulador 3D integrat amb ROS2. Permet simular robots, sensors (LIDAR, càmera, IMU) i
+entorns físics amb dinàmica realista, sense hardware real.
+Go to Pose
+Mou el robot fins a una pose objectiu (xgoal, ygoal, θgoal). Tres fases: (1) girar per orientar-se
+cap al goal, (2) avançar fins la posició, (3) girar fins l'orientació final. Controladors proporcionals
+simples. No detecta obstacles.
+Target Pursuit (seguiment d'objectiu)
+El robot segueix un objectiu mòbil detectat pel sensor. En cada cicle, mesura angle i distància
+fins l'objectiu i aplica control proporcional. Velocitat lineal ∝ distància, velocitat angular ∝ angle.
+Totalment reactiu, sense planificació.
+Obstacle Avoidance (evitació d'obstacles)
+En cada cicle llegeix el sensor, detecta obstacles en la zona de seguretat i genera una velocitat
+angular per evitar-los. Implementacions: Vector Field Histogram (VFH), Dynamic Window
+Approach (DWA), potencials artificials. DWA genera una finestra de velocitats factibles (v, ω) i
+avalua quines eviten obstacles mentre s'aproximen al goal.
+Waypoints (seguiment de punts de pas)
+El robot recorre una seqüència de waypoints en ordre. Per cada punt aplica Go to Pose fins
+arribar-hi (dins un radi d'acceptació ε), llavors passa al següent. Pot combinar-se amb evitació
+d'obstacles. Usat en missions de patrulla i cartografia.
+Punts on l'examen sol posar trampes
+• El signe de ψ̇ en el diferencial: (vR − vL) no al revés.
+• La inversió de la matriu homogènia: la translació s'ha de rotar (−Rᵀt, no −t).
+• La fórmula del landmark: β és angle relatiu al robot (ja porta restada θv).
+• PGO vs EKF-SLAM: PGO corregeix tota la trajectòria, l'EKF sols l'última predicció.
+Els conceptes marcats amb (Formulari) al llarg d'aquest document corresponen a les fórmules del Full de
+Fórmules oficial de l'examen i exigeixen saber operar-les numèricament.
