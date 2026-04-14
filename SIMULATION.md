@@ -37,6 +37,8 @@ sudo shutdown now
 
 Escull un mon:
 ```bash
+pkill -9 ruby && pkill -9 gz-sim-server && pkill -9 -f "gz sim"
+export TURTLEBOT3_MODEL=burger
 ros2 launch turtlebot3_gazebo empty_world.launch.py
 ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
 ros2 launch turtlebot3_gazebo turtlebot3_house.launch.py
