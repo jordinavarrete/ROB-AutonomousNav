@@ -7,7 +7,6 @@ as required by the Autonomous Navigation project Phase I & II.
 """
 
 import math
-import struct
 import numpy as np
 
 class MapBuilder:
@@ -125,10 +124,14 @@ free_thresh: 0.196
             f.write(yaml_content)
         print(f"Exported YAML to {yaml_file}")
 
-if __name__ == '__main__':
-    # Test builder
+def main(args=None):
+    # Standalone smoke test export
     mb = MapBuilder()
     rad = np.linspace(-math.pi, math.pi, 50)
     ranges = np.ones(50) * 2.0
     mb.update_scan(0, 0, 0, rad, ranges)
     mb.export('test_map')
+
+
+if __name__ == '__main__':
+    main()
