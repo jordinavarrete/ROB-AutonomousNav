@@ -43,15 +43,16 @@ class Config:
 # IMPORTS
 # ============================================================
 import math
+from pathlib import Path
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from tf2_ros import Buffer, TransformListener
 from tf2_ros import LookupException, ConnectivityException, ExtrapolationException
 
 from geometry_msgs.msg import TwistStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, OccupancyGrid
 from sensor_msgs.msg import LaserScan
 
 # Importa els mòduls del teu paquet
@@ -83,11 +84,38 @@ class DebugNavNode(Node):
         self.declare_parameter('start_y',       Config.START_Y)
         self.declare_parameter('start_yaw_deg', Config.START_YAW_DEG)
         self.declare_parameter('test_distance', Config.TEST_DISTANCE)
+        self.declare_parameter('map_output_prefix', 'debug_generated_map')
+        self.declare_parameter('map_save_delay_sec', 2.0)
+        self.declare_parameter('map_mode', 'scale')
+        self.declare_parameter('map_occupied_thresh', 0.65)
+        self.declare_parameter('map_free_thresh', 0.25)
+        self.declare_parameter('map_overwrite', False)
 
         start_x       = self.get_parameter('start_x').value
         start_y       = self.get_parameter('start_y').value
         start_yaw_deg = self.get_parameter('start_yaw_deg').value
         test_distance = self.get_parameter('test_distance').value
+        self._map_output_prefix = self.get_parameter('map_output_prefix').value
+        self._map_save_delay_sec = float(self.get_parameter('map_save_delay_sec').value)
+        self._map_mode = str(self.get_parameter('map_mode').value).lower()
+        self._map_occupied_thresh = float(self.get_parameter('map_occupied_thresh').value)
+        self._map_free_thresh = float(self.get_parameter('map_free_thresh').value)
+        self._map_overwrite = bool(self.get_parameter('map_overwrite').value)
+
+        if self._map_mode not in ('trinary', 'scale'):
+            self.get_logger().warn(
+                f"map_mode='{self._map_mode}' no vàlid. S'usarà 'scale'."
+            )
+            self._map_mode = 'scale'
+
+        self._map_occupied_thresh = min(max(self._map_occupied_thresh, 0.0), 1.0)
+        self._map_free_thresh = min(max(self._map_free_thresh, 0.0), 1.0)
+        if self._map_free_thresh >= self._map_occupied_thresh:
+            self.get_logger().warn(
+                'map_free_thresh ha de ser menor que map_occupied_thresh; s\'ajusten valors.'
+            )
+            self._map_free_thresh = 0.25
+            self._map_occupied_thresh = 0.65
 
         start_yaw_rad = math.radians(start_yaw_deg)
 
@@ -119,6 +147,11 @@ class DebugNavNode(Node):
         # ----------------------------------------------------------
         qos_reliable    = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,    depth=10)
         qos_best_effort = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, depth=10)
+        qos_map = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
 
         # ----------------------------------------------------------
         # Publisher
@@ -130,6 +163,7 @@ class DebugNavNode(Node):
         # ----------------------------------------------------------
         self.create_subscription(LaserScan, '/scan', self._scan_cb, qos_best_effort)
         self.create_subscription(Odometry,  '/odom', self._odom_cb, qos_reliable)
+        self.create_subscription(OccupancyGrid, '/map', self._map_cb, qos_map)
 
         # ----------------------------------------------------------
         # TF2 per llegir pose SLAM (opcional, cau en odometria si no hi ha SLAM)
@@ -146,8 +180,13 @@ class DebugNavNode(Node):
 
         self._scan_ready  = False
         self._odom_ready  = False
+        self._map_ready   = False
         self._arrived     = False
         self._prev_yaw    = start_yaw_rad
+        self._latest_map  = None
+        self._map_saved   = False
+        self._map_update_count = 0
+        self._arrived_time_ns = None
 
         # ----------------------------------------------------------
         # Sub-mòduls
@@ -173,6 +212,14 @@ class DebugNavNode(Node):
         )
 
         self.get_logger().info('Node inicialitzat. Esperant primer /scan i /odom...')
+        self.get_logger().info(
+            f'Subscrit a /map. Mapa de sortida: {self._map_output_prefix}.pgm/.yaml'
+        )
+        self.get_logger().info(
+            f"Exportació mapa: mode={self._map_mode}, delay={self._map_save_delay_sec:.1f}s, "
+            f"occ_thresh={self._map_occupied_thresh:.2f}, free_thresh={self._map_free_thresh:.2f}, "
+            f"overwrite={self._map_overwrite}"
+        )
 
     # ==========================================================
     # CALLBACKS ROS2
@@ -204,6 +251,12 @@ class DebugNavNode(Node):
         else:
             self._x, self._y, self._yaw = odom_x, odom_y, odom_yaw
 
+    def _map_cb(self, msg: OccupancyGrid) -> None:
+        """Desa l'últim OccupancyGrid rebut per exportar-lo a fitxer."""
+        self._latest_map = msg
+        self._map_ready = True
+        self._map_update_count += 1
+
     # ==========================================================
     # WATCHDOG (50 Hz) — SEGURETAT
     # ==========================================================
@@ -232,8 +285,13 @@ class DebugNavNode(Node):
         if not self._scan_ready or not self._odom_ready:
             return
 
-        # Ja hem arribat, no fem res més
+        # Ja hem arribat: mantenim robot parat i esperem uns segons
+        # perquè SLAM publiqui un últim refinament de /map abans de desar.
         if self._arrived:
+            if not self._map_saved and self._arrived_time_ns is not None:
+                elapsed = (self.get_clock().now().nanoseconds - self._arrived_time_ns) / 1e9
+                if elapsed >= self._map_save_delay_sec:
+                    self._save_map_files()
             return
 
         # Actualitza anti-stuck (delta de yaw acumulat)
@@ -272,6 +330,10 @@ class DebugNavNode(Node):
             )
             self.get_logger().info('=' * 55)
             self._publish_stop()
+            self._arrived_time_ns = self.get_clock().now().nanoseconds
+            self.get_logger().info(
+                f'Esperant {self._map_save_delay_sec:.1f}s per exportar el mapa final...'
+            )
 
         # --- Log de progrés cada segon (cada 20 ticks) ---
         if not hasattr(self, '_tick'):
@@ -343,6 +405,100 @@ class DebugNavNode(Node):
         """Atura el robot en apagar el node."""
         self.get_logger().info('Apagant debug_nav_node — parant robot...')
         self._publish_stop()
+        self._save_map_files()
+
+    def _save_map_files(self) -> None:
+        """Escriu el darrer mapa rebut a format PGM + YAML."""
+        if self._map_saved:
+            return
+
+        if not self._map_ready or self._latest_map is None:
+            self.get_logger().warn(
+                'No s\'ha rebut cap missatge a /map; no es pot exportar el mapa.'
+            )
+            return
+
+        grid = self._latest_map
+        width = grid.info.width
+        height = grid.info.height
+        data = grid.data
+
+        if len(data) != width * height:
+            self.get_logger().error(
+                'Dimensions inconsistents del mapa; exportació cancel·lada.'
+            )
+            return
+
+        output_prefix = Path.cwd() / str(self._map_output_prefix)
+        pgm_path = output_prefix.with_suffix('.pgm')
+        yaml_path = output_prefix.with_suffix('.yaml')
+        if not self._map_overwrite:
+            pgm_path, yaml_path = self._next_available_output_paths(output_prefix)
+
+        try:
+            with pgm_path.open('wb') as pgm:
+                pgm.write(f'P5\n{width} {height}\n255\n'.encode('ascii'))
+                occupied_int = int(round(self._map_occupied_thresh * 100.0))
+                free_int = int(round(self._map_free_thresh * 100.0))
+                for y in range(height - 1, -1, -1):
+                    row_base = y * width
+                    row = bytearray(width)
+                    for x in range(width):
+                        value = data[row_base + x]
+                        if value < 0:
+                            row[x] = 205
+                        else:
+                            if self._map_mode == 'trinary':
+                                if value >= occupied_int:
+                                    row[x] = 0
+                                elif value <= free_int:
+                                    row[x] = 254
+                                else:
+                                    row[x] = 205
+                            else:
+                                row[x] = int(round((100 - value) * 255 / 100.0))
+                    pgm.write(row)
+
+            origin = grid.info.origin.position
+            yaw = self._quat_to_yaw(grid.info.origin.orientation)
+            yaml_content = (
+                f'image: {pgm_path.name}\n'
+                f'mode: {self._map_mode}\n'
+                f'resolution: {grid.info.resolution}\n'
+                f'origin: [{origin.x}, {origin.y}, {yaw}]\n'
+                'negate: 0\n'
+                f'occupied_thresh: {self._map_occupied_thresh}\n'
+                f'free_thresh: {self._map_free_thresh}\n'
+            )
+            yaml_path.write_text(yaml_content, encoding='ascii')
+
+            self._map_saved = True
+            self.get_logger().info(
+                f'Mapa exportat correctament: {pgm_path} i {yaml_path} '
+                f'(actualitzacions /map rebudes: {self._map_update_count})'
+            )
+        except OSError as exc:
+            self.get_logger().error(f'Error exportant mapa: {exc}')
+
+    @staticmethod
+    def _next_available_output_paths(base_prefix: Path):
+        """Retorna rutes lliures per evitar sobreescriure fitxers existents."""
+        pgm_path = base_prefix.with_suffix('.pgm')
+        yaml_path = base_prefix.with_suffix('.yaml')
+        if not pgm_path.exists() and not yaml_path.exists():
+            return pgm_path, yaml_path
+
+        for idx in range(1, 10000):
+            candidate_prefix = base_prefix.parent / f'{base_prefix.name}_{idx:03d}'
+            candidate_pgm = candidate_prefix.with_suffix('.pgm')
+            candidate_yaml = candidate_prefix.with_suffix('.yaml')
+            if not candidate_pgm.exists() and not candidate_yaml.exists():
+                return candidate_pgm, candidate_yaml
+
+        # Fallback extremadament improbable, però evita bloqueig.
+        stamp = str(int(rclpy.clock.Clock().now().nanoseconds / 1e9))
+        fallback_prefix = base_prefix.parent / f'{base_prefix.name}_{stamp}'
+        return fallback_prefix.with_suffix('.pgm'), fallback_prefix.with_suffix('.yaml')
 
 
 # ============================================================

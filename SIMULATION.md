@@ -89,3 +89,7 @@ ros2 run autonomous_nav debug_station_node
 
 - Terminal SSH del robot: nomes comandes del robot (`bringup`, `shutdown`, etc.).
 - Terminal del PC: simulacio Gazebo, RViz, teleop, build i execucio del teu codi.
+
+## 8) SLAM
+
+ros2 launch slam_toolbox online_async_launch.py use_sim_time:=true
