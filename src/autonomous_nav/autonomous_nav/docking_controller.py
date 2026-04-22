@@ -42,6 +42,11 @@ class DockingController:
         if self._log:
             self._log.info(f"[DOCKING] Initiated precision docking towards ({station_x:.3f}, {station_y:.3f})")
 
+    def update_target(self, station_x: float, station_y: float):
+        """Update docking target without resetting the state machine."""
+        self.target_x = station_x
+        self.target_y = station_y
+
     def step(self, current_x: float, current_y: float, current_yaw: float) -> VelocityCommand:
         """
         Call this periodically at 20Hz instead of default WaypointNavigator.

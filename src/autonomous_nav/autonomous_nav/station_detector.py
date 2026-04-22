@@ -302,6 +302,41 @@ class StationDetector:
         """Return the confirmed StationResult, or None if not yet found."""
         return self._confirmed
 
+    def detect_single(
+        self,
+        robot_x: float,
+        robot_y: float,
+        robot_yaw: float,
+    ) -> Optional[StationResult]:
+        """
+        Run one detection cycle WITHOUT confirmation.
+
+        Returns a StationResult if 4 pillars forming a valid square are
+        found in the current scan, regardless of confirmation history.
+        Used during DOCKING for live station tracking.
+
+        Args:
+            robot_x/y:   Robot position in map frame [m].
+            robot_yaw:   Robot heading in map frame [rad].
+
+        Returns:
+            StationResult or None.
+        """
+        if not self._scan_ready:
+            return None
+
+        clusters   = self._cluster_scan(self._scan_points)
+        candidates = self._filter_pillar_candidates(clusters)
+        quad       = self._find_square_quad(candidates)
+
+        if quad is None:
+            return None
+
+        cx_r = sum(p.centroid_x for p in quad) / 4
+        cy_r = sum(p.centroid_y for p in quad) / 4
+
+        return self._build_result(quad, cx_r, cy_r, robot_x, robot_y, robot_yaw)
+
     def reset(self) -> None:
         """Reset detector state (use if re-scanning after false positive)."""
         self._confirm_count = 0

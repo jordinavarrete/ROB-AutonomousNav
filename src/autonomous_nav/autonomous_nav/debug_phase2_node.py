@@ -304,6 +304,10 @@ class DebugPhase2Node(Node):
         self._dock_wall_follow_ticks   = 0
         self._dock_recovery_cooldown   = 0
 
+        # ---- Pilars en temps real durant docking ----
+        self._live_pillars_map         = []    # [(x,y), ...] 4 pilars actualitzats
+        self._inside_pillars           = False # True quan el robot és dins els pilars
+
         # ----------------------------------------------------------
         # Banner inicial
         # ----------------------------------------------------------
@@ -348,7 +352,8 @@ class DebugPhase2Node(Node):
         log('    EXPLORE(Q↔R) → detecta estació → guarda posició')
         log('    → GO_BASE(P) → RETURN_DETECT (torna al punt detecció)')
         log('    → re-detecta estació (compara precisió)')
-        log('    → DOCKING (amb avoidance) → DONE')
+        log('    → DOCKING (detecció contínua; avoidance OFF dins pilars)')
+        log('    → DONE')
         log('=' * 60)
 
     # ==========================================================
@@ -443,6 +448,8 @@ class DebugPhase2Node(Node):
             return
 
         if self._mission_state == self._DOCKING:
+            if self._inside_pillars:
+                return   # dins els pilars: els pilars NO són obstacles
             if self._avoider.is_front_danger() and not self._docker.is_docked():
                 self._publish_stop()
                 self.get_logger().warn(
@@ -740,6 +747,8 @@ class DebugPhase2Node(Node):
         self._mission_state = self._DOCKING
         self._avoider.reset()
         self._docker.start_docking(result.centre_map_x, result.centre_map_y)
+        self._live_pillars_map       = list(result.pillars_map)
+        self._inside_pillars         = False
         self._waiting_redetect_at_pose = False
         self._dock_best_dist         = float('inf')
         self._dock_no_progress_ticks = 0
@@ -772,18 +781,72 @@ class DebugPhase2Node(Node):
 
     def _step_docking(self) -> None:
         """
-        DockingController + ObstacleAvoidance:
-          1. dock_cmd  = DockingController.step(...)
-          2. avoid_cmd, in_avoidance = ObstacleAvoidance.compute(...)
-          3. Si in_avoidance → usa avoid_cmd; sinó → usa dock_cmd
+        DockingController + ObstacleAvoidance + detecció contínua:
+          1. detect_single() per actualitzar posició de l'estació en temps real
+          2. Comprovar si el robot és dins el polígon dels 4 pilars
+          3. Si dins → anar directe al centre (sense avoidance)
+          4. Si fora → dock_cmd + avoidance com abans
         """
         if self._docker.is_docked():
             self._publish_stop()
             self._mission_done()
             return
 
+        # ---- Detecció contínua de l'estació durant docking ----
+        live_result = self._station_det.detect_single(
+            self._x, self._y, self._yaw
+        )
+        if live_result is not None:
+            old_x = self._dock_station_x
+            old_y = self._dock_station_y
+            self._dock_station_x   = live_result.centre_map_x
+            self._dock_station_y   = live_result.centre_map_y
+            self._live_pillars_map = list(live_result.pillars_map)
+            self._docker.update_target(
+                live_result.centre_map_x, live_result.centre_map_y
+            )
+            drift = math.hypot(
+                live_result.centre_map_x - old_x,
+                live_result.centre_map_y - old_y,
+            )
+            if drift > 0.02 and self._tick % Config.CONTROL_HZ == 0:
+                self.get_logger().info(
+                    f'[DOCKING] Estació actualitzada: '
+                    f'({live_result.centre_map_x:.3f}, '
+                    f'{live_result.centre_map_y:.3f})  '
+                    f'drift={drift:.4f}m'
+                )
+
+        # ---- Comprovar si som dins els 4 pilars ----
+        was_inside = self._inside_pillars
+        if len(self._live_pillars_map) == 4:
+            self._inside_pillars = self._point_in_quad(
+                self._x, self._y, self._live_pillars_map
+            )
+        else:
+            self._inside_pillars = False
+
+        if self._inside_pillars and not was_inside:
+            self.get_logger().info(
+                '★ [DOCKING] Robot DINS els pilars — '
+                'avoidance DESACTIVAT, anant directe al centre!'
+            )
+
+        if not self._inside_pillars and was_inside:
+            self.get_logger().info(
+                '[DOCKING] Robot FORA dels pilars — '
+                'avoidance RE-ACTIVAT.'
+            )
+
+        # ---- DockingController sempre calcula el seu command ----
         dock_cmd = self._docker.step(self._x, self._y, self._yaw)
 
+        # ---- Si dins els pilars: anar directe al centre ----
+        if self._inside_pillars:
+            self._publish(dock_cmd.linear_x, dock_cmd.angular_z)
+            return
+
+        # ---- Fora dels pilars: avoidance actiu ----
         target_x = self._docker.target_x if self._docker.target_x is not None else self._x
         target_y = self._docker.target_y if self._docker.target_y is not None else self._y
         avoid_cmd, in_avoidance = self._avoider.compute(
@@ -831,6 +894,55 @@ class DebugPhase2Node(Node):
             self._publish(avoid_cmd.linear_x, avoid_cmd.angular_z)
         else:
             self._publish(dock_cmd.linear_x, dock_cmd.angular_z)
+
+    # ==========================================================
+    # HELPERS — POINT IN QUADRILATERAL
+    # ==========================================================
+
+    @staticmethod
+    def _point_in_quad(
+        px: float, py: float,
+        vertices: list,
+    ) -> bool:
+        """
+        Comprova si el punt (px, py) és dins el quadrilàter convex
+        format pels 4 vèrtexs (pilars).
+
+        Ordena els vèrtexs per angle respecte al centroide i aplica
+        el test de producte vectorial (cross product winding).
+
+        Args:
+            px, py:    Punt a comprovar (posició robot en mapa).
+            vertices:  Llista de 4 tuples (x, y) — posicions dels pilars.
+
+        Returns:
+            True si el punt és dins el polígon convex.
+        """
+        if len(vertices) != 4:
+            return False
+
+        # Centroide
+        cx = sum(v[0] for v in vertices) / 4
+        cy = sum(v[1] for v in vertices) / 4
+
+        # Ordenar per angle respecte al centroide (sentit anti-horari)
+        sorted_verts = sorted(
+            vertices,
+            key=lambda v: math.atan2(v[1] - cy, v[0] - cx)
+        )
+
+        # Test cross product: el punt ha de quedar al mateix costat
+        # de totes les arestes del polígon convex
+        n = len(sorted_verts)
+        for i in range(n):
+            x1, y1 = sorted_verts[i]
+            x2, y2 = sorted_verts[(i + 1) % n]
+            # Cross product de (aresta) × (punt - vèrtex)
+            cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+            if cross < 0:
+                return False    # fora del polígon convex
+
+        return True
 
     # ==========================================================
     # MISSIÓ COMPLETADA
@@ -925,6 +1037,7 @@ class DebugPhase2Node(Node):
         )
         av_state = self._avoider.get_state().name
         loc_src  = 'SLAM' if self._slam_active else 'ODOM'
+        inside   = 'YES' if self._inside_pillars else 'no'
 
         self.get_logger().info(
             f'[TELEM]'
@@ -934,6 +1047,7 @@ class DebugPhase2Node(Node):
             f'  dist_station={dist:.3f}m'
             f'  dock_state={self._docker.state}'
             f'  avoid={av_state}'
+            f'  inside={inside}'
             f'  loc={loc_src}'
         )
 
