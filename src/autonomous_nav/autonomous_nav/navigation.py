@@ -43,17 +43,21 @@ class Config:
 
     # Phase waypoint lists
     WAYPOINTS_PHASE1 = [
-        (3.72,  2.55),   # Punt B
-        (5.92,  8.12),   # Porta (door)
-        (5.10, 12.61),   # Punt O
-        (5.00, 11.69),   # Punt Base
+        (4.280,  1.735),   # Punt A
+        (4.880,  2.535),   # Punt C
+        (5.080,  5.740),   # Punt D
+        (5.480, 10.545),   # Punt F
+        (6.280, 11.685),   # Porta (Door)
     ]
 
     WAYPOINTS_PHASE2 = [
-        (0.30, 11.01),   # Punt P
-        (1.90, 12.21),   # Punt Q
-        (7.12, 12.61),   # Punt R
-        (5.00, 11.69),   # Return to Punt Base
+        (3.475, 15.390),   # P Base
+        (9.115, 14.190),   # Punt Q
+        (7.310, 16.190),   # Punt R
+        (3.675, 14.190),   # Punt S
+        (1.275, 14.990),   # Punt T
+        (1.075, 16.190),   # Punt U
+        (3.475, 15.390),   # Return to P Base (docking station)
     ]
 
 

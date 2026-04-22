@@ -35,7 +35,7 @@ setup(
             'debug_station_node = autonomous_nav.debug_station_node:main',
             'debug_docking_node = autonomous_nav.debug_docking_node:main',
             'debug_core_modules = autonomous_nav.debug_core_modules:main',
-                'map_builder = autonomous_nav.map_builder:main',
+            'debug_phase1_node = autonomous_nav.debug_phase1_node:main',
         ],
     },
 )
