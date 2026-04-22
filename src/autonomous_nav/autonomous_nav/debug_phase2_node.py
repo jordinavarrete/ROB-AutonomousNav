@@ -60,11 +60,12 @@ class Config:
     START_Y           = 14.190  # m
     START_YAW_DEG     = 0.0     # graus
 
-    # Waypoints del bucle d'exploració (Q → R → Q → R → ...)
-    LOOP_LABELS = ['Q', 'R']
+    # Waypoints del bucle d'exploració (Q → R → U → T)
+    LOOP_LABELS = ['R', 'U', 'T']
     LOOP_WAYPOINTS = [
-        (9.115, 14.190),   # Punt Q
         (7.310, 16.190),   # Punt R
+        (1.075, 16.190),   # Punt U
+        (1.275, 14.990),   # Punt T
     ]
 
     # Punt Base (destí intermedi)
@@ -258,7 +259,7 @@ class DebugPhase2Node(Node):
         # ----------------------------------------------------------
         self._loop_wps    = list(Config.LOOP_WAYPOINTS)
         self._loop_labels = list(Config.LOOP_LABELS)
-        self._loop_idx    = 1   # primer objectiu: R (ja som a Q)
+        self._loop_idx    = 0   # primer objectiu: R (ja som a Q)
         self._loop_count  = 0
         self._legs_done   = 0
 
@@ -338,8 +339,11 @@ class DebugPhase2Node(Node):
         log('=' * 60)
         log(f'  Posició inicial (Punt Q) : ({sx:.3f}, {sy:.3f})'
             f'  yaw={syaw:.1f}°')
-        log(f'  Bucle exploració         : Q ↔ R (fins detectar estació)')
-        for lbl, (wx, wy) in zip(self._loop_labels, self._loop_wps):
+        log(f'  Seqüència exploració     : Q → R → U → T (fins detectar estació)')
+        # Show all waypoints including starting point Q
+        all_labels = ['Q'] + self._loop_labels
+        all_wps = [(Config.START_X, Config.START_Y)] + self._loop_wps
+        for lbl, (wx, wy) in zip(all_labels, all_wps):
             log(f'    Punt {lbl:5s} → ({wx:.3f}, {wy:.3f})')
         log(f'  Punt Base                : ({Config.BASE_X:.3f}, {Config.BASE_Y:.3f})')
         log('=' * 60)
@@ -349,7 +353,7 @@ class DebugPhase2Node(Node):
         log(f'  CSV log      : {Config.LOG_PATH}')
         log('=' * 60)
         log('  Flux:')
-        log('    EXPLORE(Q↔R) → detecta estació → guarda posició')
+        log('    EXPLORE(Q→R→U→T) → detecta estació → guarda posició')
         log('    → GO_BASE(P) → RETURN_DETECT (torna al punt detecció)')
         log('    → re-detecta estació (compara precisió)')
         log('    → DOCKING (detecció contínua; avoidance OFF dins pilars)')
@@ -590,7 +594,7 @@ class DebugPhase2Node(Node):
         self.get_logger().info('=' * 50)
         self.get_logger().info(
             f'  ✓ WAYPOINT ASSOLIT: Punt {lbl}'
-            f'  [tram {self._legs_done}, volta {self._loop_count + 1}]'
+            f'  [tram {self._legs_done}]'
         )
         self.get_logger().info(
             f'    Posició final : ({self._x:.3f}, {self._y:.3f})'
@@ -598,14 +602,19 @@ class DebugPhase2Node(Node):
         )
         self.get_logger().info('=' * 50)
 
-        if self._loop_idx == 1:
-            self._loop_idx = 0
-        else:
-            self._loop_idx = 1
-            self._loop_count += 1
+        # Move to next waypoint in sequence
+        self._loop_idx += 1
+        
+        # If we've reached the last waypoint (T), stop exploration
+        if self._loop_idx >= len(self._loop_wps):
             self.get_logger().info(
-                f'  ↻ Volta {self._loop_count} completada — reiniciant bucle Q→R'
+                '  ✓ SEQÜÈNCIA COMPLETADA: Q → R → U → T'
             )
+            self.get_logger().info(
+                '  Estació no detectada durant l\'exploració — finalitzant missió'
+            )
+            self._mission_done()
+            return
 
         if self._first_station_result is not None:
             return
