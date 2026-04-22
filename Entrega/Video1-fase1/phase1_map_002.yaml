@@ -1,0 +1,7 @@
+image: phase1_map_002.pgm
+mode: scale
+resolution: 0.05000000074505806
+origin: [-2.8727446917789328, -1.8443250643588365, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.25

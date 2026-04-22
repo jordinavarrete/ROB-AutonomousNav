@@ -47,22 +47,17 @@ class Config:
 
     # Waypoints Fase I (Punt A és la posició inicial, no un objectiu)
     # Etiquetes corresponents a cada waypoint:
-    WAYPOINT_LABELS = ['C', 'D', 'F']
+    WAYPOINT_LABELS = ['C', 'D', 'F', 'Q']
     WAYPOINTS = [
         (4.880,  2.535),   # Punt C
         (5.080,  5.740),   # Punt D
-        (5.480, 10.545),   # Punt F  ← darrer WP normal; després: cerca porta
+        (5.480, 10.545),   # Punt F
+        (9.115, 14.190),   # Punt Q  ← darrer WP; després: finalitzar
     ]
 
     # Coordenades nominals de la Porta (usades com a destí de seek si no
     # es detecta la porta real abans d'arribar-hi)
-    DOOR_NOMINAL_X    = 6.280   # m
-    DOOR_NOMINAL_Y    = 11.685  # m
-
-    # Distància des de la qual s'activa el DoorDetector (en metres abans
-    # d'arribar al waypoint F, o just en sortir de F)
-    # El detector s'activa sempre en entrar a SEEK_DOOR (després de F).
-    DOOR_DETECT_RANGE = 3.50    # m — màx range del LiDAR per a la detecció
+    # ELIMINAT: Ja no busquem porta, anem directament a Q
 
     # Rates de control
     CONTROL_HZ  = 20    # Hz — loop principal
@@ -101,7 +96,6 @@ from sensor_msgs.msg import LaserScan
 from autonomous_nav.navigation import WaypointNavigator, normalize_angle
 from autonomous_nav.obstacle_avoidance import ObstacleAvoidance
 from autonomous_nav.mission_logger import MissionLogger
-from autonomous_nav.door_detector import DoorDetector
 
 
 # ============================================================
@@ -113,9 +107,7 @@ class DebugPhase1Node(Node):
 
     Màquina d'estats de missió:
         WAITING       → esperant primer /scan i /odom
-        NAVIGATE      → navegant cap als waypoints C, D, F
-        SEEK_DOOR     → après F: navega cap a Porta nominal amb DoorDetector actiu
-        APPROACH_DOOR → porta real detectada; navega al seu centre real
+        NAVIGATE      → navegant cap als waypoints C, D, F, Q
         DONE          → Fase I completada
 
     El WaypointNavigator gestiona la màquina d'estats per waypoint
@@ -126,8 +118,6 @@ class DebugPhase1Node(Node):
     # ---- Estats de la missió del node ----
     _WAITING       = 'WAITING'
     _NAVIGATE      = 'NAVIGATE'
-    _SEEK_DOOR     = 'SEEK_DOOR'      # navega cap a Porta nominal + detector actiu
-    _APPROACH_DOOR = 'APPROACH_DOOR'  # porta real detectada; navega al centre real
     _DONE          = 'DONE'
 
     def __init__(self) -> None:
@@ -266,7 +256,6 @@ class DebugPhase1Node(Node):
         self._navigator   = WaypointNavigator(logger=self.get_logger())
         self._avoider     = ObstacleAvoidance(logger=self.get_logger())
         self._csv_logger  = MissionLogger()   # CSV logger (no _logger: conflicte amb rclpy Node)
-        self._door_detector = DoorDetector(logger=self.get_logger())
 
         # Posa la pose inicial al navegador
         self._navigator.set_odom_pose(start_x, start_y, start_yaw_rad)
@@ -275,23 +264,9 @@ class DebugPhase1Node(Node):
         # Estat de la missió
         # ----------------------------------------------------------
         self._mission_state  = self._WAITING
-        self._arrived_time   = None   # nanoseconds quan arriba a la Porta
+        self._arrived_time   = None   # nanoseconds quan arriba a Q
         self._tick           = 0      # comptador de ticks (20 Hz)
         self._n_obstacles    = 0      # actualitzat per ObstacleAvoidance
-
-        # ---- Estat porta ----
-        # Coordenades del waypoint actiu en SEEK_DOOR / APPROACH_DOOR.
-        # Inicialment apunten a la Porta nominal; en detectar la porta real
-        # es sobreescriuen amb el centre detectat.
-        self._door_target_x    = Config.DOOR_NOMINAL_X
-        self._door_target_y    = Config.DOOR_NOMINAL_Y
-        self._door_found       = False   # True quan DoorDetector confirma la porta
-
-        # Rastreja si l'avoider estava en WALL_FOLLOW el tick anterior.
-        # Permet detectar la transició FREE→WALL_FOLLOW i WALL_FOLLOW→FREE
-        # durant SEEK_DOOR / APPROACH_DOOR per resetar el detector i
-        # reprendre la cerca de porta des de la nova posició.
-        self._was_wall_following = False
 
         # ----------------------------------------------------------
         # Banner inicial
@@ -336,9 +311,7 @@ class DebugPhase1Node(Node):
         log('  Avoidance    : Bug2 reactiu')
         log(f'  CSV log      : {Config.LOG_PATH}')
         log('=' * 60)
-        log(f'  Porta nominal: ({Config.DOOR_NOMINAL_X:.3f}, {Config.DOOR_NOMINAL_Y:.3f})')
-        log('  Porta real   : detectada per DoorDetector (LiDAR gap 0.80m)')
-        log('  Flux final   : F → SEEK_DOOR → APPROACH_DOOR → DONE')
+        log('  Flux final   : C → D → F → Q → DONE')
         log('=' * 60)
 
     # ==========================================================
@@ -346,9 +319,8 @@ class DebugPhase1Node(Node):
     # ==========================================================
 
     def _scan_cb(self, msg: LaserScan) -> None:
-        """Ingestió del scan LiDAR → ObstacleAvoidance + DoorDetector."""
+        """Ingestió del scan LiDAR → ObstacleAvoidance."""
         self._avoider.update_scan(msg)
-        self._door_detector.update_scan(msg)
         self._scan_ready = True
 
         # Estimació ràpida del nombre d'obstacles a prop (sectors actius)
@@ -510,11 +482,7 @@ class DebugPhase1Node(Node):
         self._prev_yaw = self._yaw
 
         # ---- Tria el waypoint objectiu actiu ----
-        if self._mission_state == self._NAVIGATE:
-            wp_x, wp_y = self._waypoints[self._wp_idx]
-        else:
-            # SEEK_DOOR o APPROACH_DOOR: objectiu és _door_target_x/y
-            wp_x, wp_y = self._door_target_x, self._door_target_y
+        wp_x, wp_y = self._waypoints[self._wp_idx]
 
         # ---- Obstacle avoidance ----
         cmd, in_avoidance = self._avoider.compute(
@@ -527,34 +495,10 @@ class DebugPhase1Node(Node):
             nav_cmd = self._navigator.step()
             self._publish(nav_cmd.linear_x, nav_cmd.angular_z)
 
-        # ---- Detecta transicions wall-following durant cerca de porta ----
-        # Quan el robot entra en WALL_FOLLOW en mode SEEK_DOOR/APPROACH_DOOR
-        # (perquè ha tocat la paret del costat de la porta), resetem el
-        # DoorDetector perquè pugui confirmar la porta des de la nova posició,
-        # sense que les confirmacions prèvies (d'una posició diferent) interfereixin.
-        now_wall_following = in_avoidance
-        if self._mission_state in (self._SEEK_DOOR, self._APPROACH_DOOR):
-            if now_wall_following and not self._was_wall_following:
-                self.get_logger().info(
-                    '[DOOR] Wall-following activat — resetejant detector '
-                    'per confirmar porta des de la nova posició.'
-                )
-                self._door_detector.reset()
-        self._was_wall_following = now_wall_following
-
         # ---- Lògica específica per estat ----
         if self._mission_state == self._NAVIGATE:
             if self._navigator.has_arrived():
                 self._on_waypoint_reached(wp_x, wp_y)
-
-        elif self._mission_state == self._SEEK_DOOR:
-            self._step_seek_door(wp_x, wp_y)
-
-        elif self._mission_state == self._APPROACH_DOOR:
-            # Durant l'aproximació TAMBÉ seguim detectant la porta:
-            # si el robot entra en wall-following i la veu des d'un angle
-            # diferent, actualitzem el target al nou centre confirmat.
-            self._step_approach_door()
 
         # ---- Actualitza CSV logger ----
         self._csv_logger.update(
@@ -567,7 +511,29 @@ class DebugPhase1Node(Node):
 
         # ---- Telemetria per pantalla (1 cop per segon) ----
         if self._tick % Config.CONTROL_HZ == 0:
-            self._print_telemetry(wp_x, wp_y)
+            dist      = math.hypot(self._x - wp_x, self._y - wp_y)
+            nav_state = self._navigator.get_state().name
+            av_state  = self._avoider.get_state().name
+            loc_src   = 'SLAM' if self._slam_active else 'ODOM'
+            ms        = self._mission_state
+
+            # Etiqueta del destí actiu
+            if ms == self._NAVIGATE:
+                lbl = f'Punt{self._wp_labels[self._wp_idx]}' if self._wp_idx < self._total_wps else 'Q'
+            else:
+                lbl = ms
+
+            self.get_logger().info(
+                f'[TELEM]'
+                f'  pos=({self._x:.3f},{self._y:.3f})'
+                f'  yaw={math.degrees(self._yaw):6.1f}°'
+                f'  dest={lbl}'
+                f'  dist={dist:.3f}m'
+                f'  nav={nav_state}'
+                f'  avoid={av_state}'
+                f'  loc={loc_src}'
+                f'  obs={self._n_obstacles}'
+            )
 
     # ==========================================================
     # GESTIÓ WAYPOINTS
@@ -618,173 +584,20 @@ class DebugPhase1Node(Node):
         self._wp_idx += 1
 
         if self._wp_idx >= self._total_wps:
-            # Hem assolit F (darrer WP normal) → entrem a SEEK_DOOR
-            self._launch_door_seek()
+            # Hem assolit Q (darrer WP) → missió completada
+            self._mission_done()
         else:
             # Llança el següent waypoint normal
             self._launch_waypoint(self._wp_idx)
 
-    def _launch_door_seek(self) -> None:
-        """
-        Entra al mode SEEK_DOOR:
-        Navega cap a les coordenades nominals de la Porta mentre el
-        DoorDetector busca la porta real al LiDAR.
-        El detector ja rep scans contínuament; aquí simplement activem
-        l'estat i configurem el navegador cap al destí nominal.
-        """
-        self._mission_state  = self._SEEK_DOOR
-        self._door_target_x  = Config.DOOR_NOMINAL_X
-        self._door_target_y  = Config.DOOR_NOMINAL_Y
-        self._door_detector.reset()
-
-        dist = math.hypot(
-            Config.DOOR_NOMINAL_X - self._x,
-            Config.DOOR_NOMINAL_Y - self._y,
-        )
-
-        self.get_logger().info('─' * 50)
-        self.get_logger().info('  ▶ SEEK_DOOR — buscant porta real')
-        self.get_logger().info(
-            f'    Destí nominal : ({Config.DOOR_NOMINAL_X:.3f}, {Config.DOOR_NOMINAL_Y:.3f})')
-        self.get_logger().info(
-            f'    Distància     : {dist:.2f} m'
-        )
-        self.get_logger().info(
-            '    DoorDetector  : ACTIU (0.80 m gap)')
-        self.get_logger().info('─' * 50)
-
-        self._avoider.reset()
-        self._navigator.set_waypoint(Config.DOOR_NOMINAL_X, Config.DOOR_NOMINAL_Y)
-
-    def _step_seek_door(self, wp_x: float, wp_y: float) -> None:
-        """
-        Lògica executada cada tick en estat SEEK_DOOR.
-
-        Comprova si el DoorDetector ha confirmat la porta real.
-        Si sí → APPROACH_DOOR cap al centre real detectat.
-        Si el robot arriba al destí nominal sense detecció → usa el nominal
-        com a centre de porta (fallback) i dona la Fase I per completada.
-        """
-        # Comprova detecció de porta real
-        door = self._door_detector.detect(self._x, self._y, self._yaw)
-        if door is not None and not self._door_found:
-            self._door_found = True
-            self._launch_door_approach(door)
-            return
-
-        # Fallback: si arriba al nominal sense detecció
-        if self._navigator.has_arrived() and not self._door_found:
-            self.get_logger().warn(
-                '[DOOR] Porta no detectada en arribar al nominal — ' 
-                'usant coordenades nominals com a centre.'
-            )
-            self._mission_done(detected=False)
-
-    def _step_approach_door(self) -> None:
-        """
-        Lògica executada cada tick en estat APPROACH_DOOR.
-
-        Durant l'aproximació, el robot pot entrar en wall-following si
-        la paret del costat de la porta el bloca. En aquest cas, el
-        DoorDetector (ja resetat per la transició) pot reconfirmar la
-        porta des del nou angle i actualitzar el target si el centre real
-        mesurat difereix significativament de l'objectiu actual.
-
-        Si el robot arriba al target → Fase I completada.
-        """
-        # Comprova si hi ha una nova confirmació de porta
-        door = self._door_detector.detect(self._x, self._y, self._yaw)
-        if door is not None:
-            dist_update = math.hypot(
-                door.centre_map_x - self._door_target_x,
-                door.centre_map_y - self._door_target_y,
-            )
-            # Actualitza el target si el nou centre és prou diferent (> 5 cm)
-            if dist_update > 0.05:
-                self.get_logger().info(
-                    f'[DOOR] Target actualitzat durant APPROACH: '
-                    f'({self._door_target_x:.3f},{self._door_target_y:.3f}) → '
-                    f'({door.centre_map_x:.3f},{door.centre_map_y:.3f})  '
-                    f'Δ={dist_update:.3f}m'
-                )
-                self._door_target_x = door.centre_map_x
-                self._door_target_y = door.centre_map_y
-                # Redirigeix el navegador al nou centre (l'avoider es
-                # resetarà a la propera transició de wall-following si cal)
-                self._navigator.set_waypoint(door.centre_map_x, door.centre_map_y)
-
-        # Comprova arribada
-        if self._navigator.has_arrived():
-            self._on_door_centre_reached()
-
-    def _launch_door_approach(self, door) -> None:
-        """
-        Porta real detectada: redirigeix el robot al centre real de la porta.
-        """
-        self._mission_state  = self._APPROACH_DOOR
-        self._door_target_x  = door.centre_map_x
-        self._door_target_y  = door.centre_map_y
-
-        dist = math.hypot(
-            door.centre_map_x - self._x,
-            door.centre_map_y - self._y,
-        )
-
-        self.get_logger().info('=' * 50)
-        self.get_logger().info('  ✓ PORTA REAL DETECTADA!')
-        self.get_logger().info(
-            f'    Centre real (mapa)  : ' 
-            f'({door.centre_map_x:.3f}, {door.centre_map_y:.3f})'
-        )
-        self.get_logger().info(
-            f'    Centre nominal (mapa): ' 
-            f'({Config.DOOR_NOMINAL_X:.3f}, {Config.DOOR_NOMINAL_Y:.3f})'
-        )
-        self.get_logger().info(
-            f'    Amplada mesurada    : {door.gap_width:.3f} m'
-        )
-        self.get_logger().info(
-            f'    Heading porta (mapa): {math.degrees(door.heading_map):.1f}°'
-        )
-        self.get_logger().info(
-            f'    Distància al centre : {dist:.3f} m'
-        )
-        self.get_logger().info('  ▶ APPROACH_DOOR — navegant al centre real')
-        self.get_logger().info('=' * 50)
-
-        self._avoider.reset()
-        self._navigator.set_waypoint(door.centre_map_x, door.centre_map_y)
-
-    def _on_door_centre_reached(self) -> None:
-        """Robot al centre real de la porta → Fase I completada."""
-        dist_real = math.hypot(
-            self._x - self._door_target_x,
-            self._y - self._door_target_y,
-        )
-        dist_nom = math.hypot(
-            self._x - Config.DOOR_NOMINAL_X,
-            self._y - Config.DOOR_NOMINAL_Y,
-        )
-        self.get_logger().info('=' * 50)
-        self.get_logger().info('  ✓ CENTRE PORTA ASSOLIT')
-        self.get_logger().info(
-            f'    Posició final    : ({self._x:.3f}, {self._y:.3f})')
-        self.get_logger().info(
-            f'    Error vs real    : {dist_real:.3f} m')
-        self.get_logger().info(
-            f'    Error vs nominal : {dist_nom:.3f} m')
-        self.get_logger().info('=' * 50)
-        self._mission_done(detected=True)
-
-    def _mission_done(self, detected: bool = True) -> None:
+    def _mission_done(self) -> None:
         """Marca la fi de la Fase I i atura el robot."""
         self._mission_state = self._DONE
         self._publish_stop()
         self._arrived_time  = self.get_clock().now().nanoseconds
 
-        porta_lbl = 'porta REAL detectada' if detected else 'porta NOMINAL (fallback)'
         self.get_logger().info('★' * 50)
-        self.get_logger().info(f'  ✓✓ FASE I COMPLETADA — Robot a la {porta_lbl}!')
+        self.get_logger().info('  ✓✓ FASE I COMPLETADA — Robot al punt Q!')
         self.get_logger().info(
             f'  Posició final : ({self._x:.3f}, {self._y:.3f}, '
             f'{math.degrees(self._yaw):.1f}°)'
