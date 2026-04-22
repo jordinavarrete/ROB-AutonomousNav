@@ -12,13 +12,19 @@ Implements the Bug2 algorithm:
         - Switch to WALL_FOLLOW
 
   WALL_FOLLOW state  (this module controls):
-    · Follow the wall on the RIGHT side (proportional lateral control).
-    · Turn LEFT in-place when FRONT is blocked.
-    · Bug2 exit conditions (both required):
-        1. Perpendicular distance to m-line  < M_LINE_THRESHOLD
-        2. dist(robot, goal) < dist(H, goal) − DISTANCE_PROGRESS_MIN
+    · Follow the wall on the chosen side (proportional lateral control).
+    · Turn in-place when FRONT is blocked.
+    · Exit conditions (any of them triggers FREE):
+        A. Line-of-sight exit (priority):
+           Minimum LiDAR range in a cone around the goal bearing exceeds
+           dist(robot, goal) + LOS_CLEARANCE_MARGIN, i.e. the robot is
+           no longer behind the followed wall from the goal's perspective
+           ("robot between wall and goal" → drop avoidance, head to goal).
+        B. Bug2 m-line exit:
+           1. Perpendicular distance to m-line  < M_LINE_THRESHOLD, AND
+           2. dist(robot, goal) < dist(H, goal) − DISTANCE_PROGRESS_MIN.
     · Anti-stuck: if accumulated rotation is too low over STUCK_CHECK_TICKS,
-      apply a forced left rotation for STUCK_TURN_TICKS.
+      apply a forced in-place rotation for STUCK_TURN_TICKS.
 
   DANGER (watchdog, caller fires at 50 Hz independently):
     · is_front_danger() → True when FRONT min < DANGER_DIST.
@@ -58,10 +64,15 @@ class Config:
     CORNER_TURN_FACTOR    = 0.8    # —   — factor applied at corners
     LOST_WALL_TURN_SPEED  = 0.80   # rad/s — sharp turn when following wall is lost
 
-    # --- Bug2 exit conditions ---
+    # --- Bug2 m-line exit conditions ---
     M_LINE_THRESHOLD      = 0.15   # m   — perpendicular dist to m-line for "on line"
     DISTANCE_PROGRESS_MIN = 0.15   # m   — min extra progress toward goal to exit
     MIN_TRAVEL_FROM_HIT   = 0.20   # m   — min distance from hit point before checking exit
+
+    # --- Line-of-sight early exit ("robot between wall and goal") ---
+    LOS_CONE_HALF_DEG     = 15     # deg — half-aperture of cone around goal bearing
+    LOS_CLEARANCE_MARGIN  = 0.20   # m   — LiDAR must see ≥ (dist_to_goal + this)
+    LOS_MIN_DIST_TO_GOAL  = 0.15   # m   — skip LoS check when already at the goal
 
     # --- Anti-stuck ---
     STUCK_CHECK_TICKS     = 40     # ticks (2 s @ 20 Hz) between stuck evaluations
@@ -140,6 +151,13 @@ def _valid_range(r: float) -> bool:
     return math.isfinite(r) and r > 0.0
 
 
+def _normalize_angle(a: float) -> float:
+    """Normalise angle to (-π, π]."""
+    while a >  math.pi: a -= 2 * math.pi
+    while a < -math.pi: a += 2 * math.pi
+    return a
+
+
 # ============================================================
 # MAIN CLASS
 # ============================================================
@@ -151,7 +169,8 @@ class ObstacleAvoidance:
     control tick.  Returns velocity commands and an *in_avoidance* flag
     that tells the caller whether to suppress its own navigation command.
 
-    Wall-follow side: RIGHT  (robot turns LEFT when front is blocked).
+    Wall-follow side: dynamic (RIGHT / LEFT) — chosen at entry based on
+    which side of the robot has more free space.
     """
 
     def __init__(self, logger=None) -> None:
@@ -174,6 +193,10 @@ class ObstacleAvoidance:
         self._right_min       = float('inf')
         self._left_min        = float('inf')
         self._scan_ready      = False
+
+        # ---- Latest raw LiDAR ranges (for arbitrary-bearing queries) ----
+        self._latest_ranges: Optional[list] = None
+        self._n_ranges: int                 = 0
 
         # ---- Bug2 m-line data (set when avoidance starts) ----
         self._hit_x: float            = 0.0
@@ -203,6 +226,9 @@ class ObstacleAvoidance:
         NaN and Inf values are filtered before any comparison.
         Must be called from the /scan subscriber callback.
 
+        Also caches the raw ranges array so the line-of-sight exit check
+        can query arbitrary bearings on demand.
+
         Args:
             msg: ``sensor_msgs/LaserScan`` from /scan (BEST_EFFORT QoS).
         """
@@ -214,7 +240,12 @@ class ObstacleAvoidance:
         self._front_left_min  = self._sector_min(ranges, n, *Config.FRONT_LEFT_SECTOR)
         self._right_min       = self._sector_min(ranges, n, *Config.RIGHT_SECTOR)
         self._left_min        = self._sector_min(ranges, n, *Config.LEFT_SECTOR)
-        self._scan_ready      = True
+
+        # Cache raw ranges for arbitrary-bearing queries (LoS exit)
+        self._latest_ranges = ranges
+        self._n_ranges      = n
+
+        self._scan_ready    = True
 
     def update_force_rotate(self, delta_yaw: float) -> None:
         """
@@ -408,11 +439,17 @@ class ObstacleAvoidance:
         """
         WALL_FOLLOW state handler — Bug2 wall-following controller.
 
-        Follows the wall on the RIGHT side.  Checks the Bug2 m-line exit
-        condition each tick.  Handles the anti-stuck override.
+        Exit checks, in priority order:
+          1. Line-of-sight: the robot has a clear direct path to the goal
+             (i.e. it is between the followed wall and the goal, so the
+             wall no longer obstructs).  Exit immediately.
+          2. Bug2 m-line: standard Bug2 exit on regaining the start–goal
+             line with net progress.
+          3. Anti-stuck forced rotation override (does NOT exit).
 
         Returns:
-            ``(cmd, True)`` — avoidance is active; caller must use this command.
+            ``(cmd, True)``  — avoidance is active; caller must use this cmd.
+            ``(zero, False)`` on the tick it exits to FREE.
         """
         # ---- Anti-stuck forced rotation override ----
         if self._force_turn_ticks > 0:
@@ -424,7 +461,20 @@ class ObstacleAvoidance:
             )
             return cmd, True
 
-        # ---- Check Bug2 exit condition ----
+        # ---- Priority exit: line of sight to goal is clear ----
+        # (Robot is between the followed wall and the waypoint.)
+        if self._check_los_exit(x, y, yaw, wp_x, wp_y):
+            dist_final = math.sqrt((x - wp_x) ** 2 + (y - wp_y) ** 2)
+            self._state         = AvoidState.FREE
+            self._exit_cooldown = Config.EXIT_COOLDOWN_TICKS
+            self._log_info(
+                f'[AVOID] WALL_FOLLOW → FREE (line of sight to goal clear)  '
+                f'pos=({x:.2f}, {y:.2f})  '
+                f'dist_to_goal={dist_final:.2f} m'
+            )
+            return VelocityCommand(0.0, 0.0), False
+
+        # ---- Bug2 m-line exit condition ----
         if self._check_mline_exit(x, y, wp_x, wp_y):
             dist_final = math.sqrt((x - wp_x) ** 2 + (y - wp_y) ** 2)
             self._state         = AvoidState.FREE
@@ -513,7 +563,121 @@ class ObstacleAvoidance:
         )
 
     # ==========================================================
-    # BUG2 EXIT CONDITION
+    # LINE-OF-SIGHT EXIT ("robot between wall and goal")
+    # ==========================================================
+
+    def _check_los_exit(
+        self, x: float, y: float, yaw: float,
+        wp_x: float, wp_y: float,
+    ) -> bool:
+        """
+        Line-of-sight early exit condition.
+
+        Returns True when the robot currently has a clear direct path to
+        the goal waypoint — i.e. the nearest LiDAR return inside a cone
+        of ±LOS_CONE_HALF_DEG around the goal bearing lies *beyond* the
+        goal (with LOS_CLEARANCE_MARGIN of slack).
+
+        This captures the case where the robot is "between the followed
+        wall and the goal": the wall is on one side and the goal is on
+        the other, with no obstacle between them.
+
+        Gates:
+          · Must have moved at least MIN_TRAVEL_FROM_HIT from the hit
+            point, to avoid exiting on the very first tick of avoidance.
+          · Must be at least LOS_MIN_DIST_TO_GOAL from the goal (if we
+            are already there, the navigator will close the loop).
+
+        Args:
+            x, y:       Robot position [m].
+            yaw:        Robot heading [rad].
+            wp_x, wp_y: Goal waypoint [m].
+
+        Returns:
+            True if the line of sight to the goal is clear and the gates
+            pass; False otherwise.
+        """
+        # ---- Gate: must have travelled away from the hit point ----
+        dist_from_hit = math.sqrt(
+            (x - self._hit_x) ** 2 + (y - self._hit_y) ** 2
+        )
+        if dist_from_hit < Config.MIN_TRAVEL_FROM_HIT:
+            return False
+
+        # ---- Gate: must not already be at the goal ----
+        dist_to_goal = math.sqrt((x - wp_x) ** 2 + (y - wp_y) ** 2)
+        if dist_to_goal < Config.LOS_MIN_DIST_TO_GOAL:
+            return False
+
+        # ---- Bearing to goal in robot frame (0=front, CCW+) ----
+        goal_bearing = _normalize_angle(
+            math.atan2(wp_y - y, wp_x - x) - yaw
+        )
+
+        # ---- Minimum LiDAR range inside cone around goal bearing ----
+        half_cone_rad = math.radians(Config.LOS_CONE_HALF_DEG)
+        min_range = self._range_min_in_cone(goal_bearing, half_cone_rad)
+
+        # ---- Clear when the cone "sees past" the goal ----
+        required = dist_to_goal + Config.LOS_CLEARANCE_MARGIN
+        return min_range > required
+
+    def _range_min_in_cone(
+        self, center_rad: float, half_cone_rad: float,
+    ) -> float:
+        """
+        Minimum valid LiDAR range within a cone around *center_rad*.
+
+        Robot-frame convention: 0 rad = front, CCW positive.  Matches the
+        TB3 LDS convention (``ranges[0]`` is directly ahead, index grows
+        counter-clockwise).  Wrap-around (cones that straddle 0° / 360°)
+        is handled the same way as ``_sector_min``.
+
+        Args:
+            center_rad:    Cone centre angle (robot frame) [rad].
+            half_cone_rad: Half-aperture of the cone        [rad].
+
+        Returns:
+            Minimum valid range [m] in the cone, or ``inf`` if the cone
+            contains no valid readings or no scan has been received yet.
+        """
+        if (not self._scan_ready or
+                self._latest_ranges is None or self._n_ranges == 0):
+            return float('inf')
+
+        ranges = self._latest_ranges
+        n      = self._n_ranges
+
+        start_deg = math.degrees(center_rad - half_cone_rad)
+        end_deg   = math.degrees(center_rad + half_cone_rad)
+
+        # Use floor/ceil so the cone interval is fully covered
+        start_idx = int(math.floor(start_deg)) % 360
+        end_idx   = int(math.ceil(end_deg))    % 360
+
+        minimum = float('inf')
+
+        if start_idx <= end_idx:
+            # Contiguous sector — no wrap
+            for i in range(start_idx, end_idx + 1):
+                r = ranges[i % n]
+                if _valid_range(r) and r < minimum:
+                    minimum = r
+        else:
+            # Sector wraps through 0° / 360°
+            for i in range(start_idx, n):
+                r = ranges[i % n]
+                if _valid_range(r) and r < minimum:
+                    minimum = r
+            for i in range(0, end_idx + 1):
+                r = ranges[i % n]
+                if _valid_range(r) and r < minimum:
+                    minimum = r
+
+        return minimum
+
+    # ==========================================================
+    # BUG2 M-LINE EXIT CONDITION
     # ==========================================================
 
     def _check_mline_exit(
@@ -621,8 +785,8 @@ class ObstacleAvoidance:
             Minimum valid range [m], or ``inf`` when the sector is empty
             or all readings are NaN / Inf.
         """
-        start_idx = int(start_deg % 360)   # e.g. -20 → 340
-        end_idx   = int(end_deg   % 360)   # e.g.  20 →  20
+        start_idx = int(start_deg) % 360   # e.g. -20 → 340
+        end_idx   = int(end_deg)   % 360   # e.g.  20 →  20
 
         minimum = float('inf')
 
@@ -668,8 +832,6 @@ class ObstacleAvoidance:
 # STANDALONE SMOKE TEST  (no ROS2 required)
 # ============================================================
 if __name__ == '__main__':
-    import math
-
     print('=== ObstacleAvoidance — standalone smoke test ===\n')
 
     # ---- Dummy LaserScan builder ----
@@ -677,7 +839,7 @@ if __name__ == '__main__':
         """Minimal LaserScan substitute for offline testing.
         Non-overlapping index ranges so one sector never bleeds into another."""
         def __init__(self, front=2.0, front_right=2.0,
-                     front_left=2.0, right=2.0, left=2.0):
+                     front_left=2.0, right=2.0, left=2.0, back=2.0):
             self.ranges = [2.0] * 360
             # FRONT: strictly inside 340–359, 0–20 (avoiding boundary indices)
             for i in list(range(341, 360)) + list(range(0, 20)):
@@ -694,6 +856,9 @@ if __name__ == '__main__':
             # LEFT: 61–89
             for i in range(61, 90):
                 self.ranges[i] = left
+            # BACK: 91–270 (everything else to the rear)
+            for i in range(91, 271):
+                self.ranges[i] = back
 
     avoider = ObstacleAvoidance(logger=None)
 
@@ -737,5 +902,67 @@ if __name__ == '__main__':
     d2 = avoider3._mline_distance(2.0, 0.0, 5.0, 0.0)
     assert abs(d2 - 0.0) < 1e-9, f'Expected 0.0 on line, got {d2}'
     print('Test 5 PASS — m-line distance correct')
+
+    # ---- Test 6: Line-of-sight early exit ----
+    # Scenario: robot is wall-following on RIGHT. Goal is behind (x=-1.5).
+    # Right side has the followed wall (0.16m). Back is clear at 3.0m.
+    # Goal bearing ≈ 180°. LoS cone around 180° → reads 3.0m >
+    # dist_to_goal (1.5) + margin (0.2) = 1.7m → CLEAR → exit.
+    avoider4 = ObstacleAvoidance(logger=None)
+    scan_followed = FakeScan(front=2.0, front_right=0.35, front_left=2.0,
+                             right=0.16, left=2.0, back=3.0)
+    avoider4.update_scan(scan_followed)
+    # Force state to WALL_FOLLOW with a hit far enough to pass the gate
+    avoider4._state = AvoidState.WALL_FOLLOW
+    avoider4._hit_x = -3.0   # hit point far behind robot
+    avoider4._hit_y =  0.0
+    avoider4._hit_dist_to_goal = 1.0
+    avoider4._wall_side = 'RIGHT'
+    # Robot at (0,0,0), goal at (-1.5,0) → goal behind (bearing ≈ 180°)
+    cmd, active = avoider4.compute(0.0, 0.0, 0.0, -1.5, 0.0)
+    assert avoider4.get_state() == AvoidState.FREE, (
+        'LoS exit should fire: back sector is clear (3.0m) > '
+        'dist_to_goal (1.5) + margin (0.2)'
+    )
+    assert not active
+    print('Test 6 PASS — LoS exit fires when goal is behind with clear back')
+
+    # ---- Test 7: LoS does NOT fire when obstacle between robot and goal ----
+    # Hit point offset from the robot→goal line so the m-line exit cannot
+    # fire (robot is not on the m-line). This isolates the LoS check.
+    avoider5 = ObstacleAvoidance(logger=None)
+    # Obstacle directly in front within cone — path to goal in front is blocked
+    scan_blocked_front = FakeScan(front=0.40, front_right=0.20, front_left=2.0,
+                                  right=0.16, left=2.0, back=2.0)
+    avoider5.update_scan(scan_blocked_front)
+    avoider5._state = AvoidState.WALL_FOLLOW
+    avoider5._hit_x = 0.0      # offset from m-line axis
+    avoider5._hit_y = 0.5
+    avoider5._hit_dist_to_goal = 3.04  # hypot(3, 0.5)
+    avoider5._wall_side = 'RIGHT'
+    # Goal ahead at (3,0): bearing 0°. Front reads 0.40m < dist_to_goal=3m
+    # → LoS blocked. m-line distance ≈ 0.49m > 0.15 → m-line blocked too.
+    cmd, active = avoider5.compute(0.0, 0.0, 0.0, 3.0, 0.0)
+    assert avoider5.get_state() == AvoidState.WALL_FOLLOW, (
+        'LoS should NOT fire: front=0.40m < dist_to_goal=3.0m'
+    )
+    assert active
+    print('Test 7 PASS — LoS does not fire when goal is obstructed')
+
+    # ---- Test 8: LoS gated by MIN_TRAVEL_FROM_HIT ----
+    avoider6 = ObstacleAvoidance(logger=None)
+    scan_clear = FakeScan(front=2.0, front_right=0.35, front_left=2.0,
+                          right=0.16, left=2.0, back=2.0)
+    avoider6.update_scan(scan_clear)
+    avoider6._state = AvoidState.WALL_FOLLOW
+    avoider6._hit_x = 0.0     # robot still at hit point
+    avoider6._hit_y = 0.0
+    avoider6._hit_dist_to_goal = 1.0
+    avoider6._wall_side = 'RIGHT'
+    cmd, active = avoider6.compute(0.0, 0.0, 0.0, 1.0, 0.0)
+    assert avoider6.get_state() == AvoidState.WALL_FOLLOW, (
+        'LoS should be gated by MIN_TRAVEL_FROM_HIT'
+    )
+    print('Test 8 PASS — LoS gated by MIN_TRAVEL_FROM_HIT')
 
     print('\nAll tests passed.')
