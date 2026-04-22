@@ -36,6 +36,7 @@ setup(
             'debug_docking_node = autonomous_nav.debug_docking_node:main',
             'debug_core_modules = autonomous_nav.debug_core_modules:main',
             'debug_phase1_node = autonomous_nav.debug_phase1_node:main',
+            'debug_phase2_node = autonomous_nav.debug_phase2_node:main',
         ],
     },
 )
